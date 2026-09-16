@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.2.1
+// @version      1.2.3
 // @description  독립 상점 구매·알 심기·부화·펫 판매와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -27,7 +27,7 @@
  * or creates a second game connection. CommonJS exports are for offline tests. */
 (function () {
   'use strict';
-  const VERSION = '1.2.1', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.2.3', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -38,6 +38,21 @@
   const quantity = item => finite(item?.quantity) ? Math.max(0, item.quantity) : 1;
   const itemId = item => String(item?.[FIELDS[item?.itemType]] || '');
   const choiceKey = item => `${item.itemType}:${itemId(item)}`;
+  // Public /data verified 2026-09-16; used only when catalog fields are absent.
+  const TOOL_LIMIT_FALLBACK = {
+    WateringCan:99,CropCleanser:99,ChilledPotion:99,FrozenPotion:99,
+    ReplenishPotion:99,XPPotion:99,RainbowPotion:99,
+    WetPotion:1,DawnlitPotion:1,AmberlitPotion:1,GoldPotion:1,Shovel:1
+  };
+  function purchaseCapacity(data,item,metadata = {}) {
+    const id=itemId(item), info={...metadata,...item};
+    const held=(data.inventory?.items || []).reduce((sum,entry) =>
+      sum+(entry?.itemType === item.itemType && itemId(entry) === id ? quantity(entry) : 0),0);
+    const max=Number(info.maxInventoryQuantity);
+    const limit=info.isOneTimePurchase === true ? 1 : Number.isFinite(max) && max>0 ? Math.floor(max) :
+      !own(info,'maxInventoryQuantity') && !own(info,'isOneTimePurchase') && item.itemType === 'Tool' ? TOOL_LIMIT_FALLBACK[id] ?? Infinity : Infinity;
+    return {held,limit,remaining:Math.max(0,limit-held)};
+  }
   const defaults = () => ({
     autoBuy: false, autoPlant: false, buy: {},
     eggs: { order: [], enabled: {}, direction: '좌', zigzag: false },
@@ -291,7 +306,11 @@
         const pending = this.pending.get(msg.requestId);
         if (pending) {
           if (msg.ok === true) pending.ack = true;
-          else pending.error = Error(failureText(String(msg.code || msg.message || '요청 거부')));
+          else {
+            const details = [...new Set([msg.code,msg.message,msg.reason,msg.error?.message]
+              .filter(value => typeof value === 'string' && value.trim()).map(value => value.trim().slice(0,160)))];
+            pending.error = Error(failureText(details.join(' · ') || '요청 거부'));
+          }
         }
       }
       const patches = msg.type === 'RoomFrame' ? msg.state?.patches : msg.type === 'PartialState' ? msg.patches : null;
@@ -361,12 +380,13 @@
     }
   }
   function failureText(code) {
-    if (/inventory.*(full|capacity|space)|(full|capacity).*inventory/i.test(code)) return '인벤토리 가득 참';
-    if (/coin|fund|balance|afford/i.test(code)) return '잔액 부족';
-    if (/stock|sold.?out/i.test(code)) return '재고 부족';
-    return `게임 요청 거부: ${code.slice(0,160)}`;
+    const detail = code.slice(0,640);
+    if (/inventory.*(full|capacity|space)|(full|capacity).*inventory/i.test(code)) return `인벤토리 가득 참 · ${detail}`;
+    if (/coin|fund|balance|afford/i.test(code)) return `잔액 부족 · ${detail}`;
+    if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
+    return `게임 요청 거부: ${detail}`;
   }
-  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,members,activeIds,sameIds,webhookURL };
+  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,members,activeIds,sameIds,webhookURL,purchaseCapacity };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -556,11 +576,17 @@
     } finally { running = null; refresh();wakeAutomation(); }
   }
   async function buy(job,shops=new Set(['*'])) {
-    let attempted = false;
+    let attempted = false, capped = false;
     const rows = shopRows().filter(row => (shops.has('*')||shops.has(row.shop)) && settings.buy[choiceKey(row.item)] && row.available > 0);
     for (const row of rows) {
       checkJob(job);
       if (!settings.buy[choiceKey(row.item)]) continue;
+      const capacity=purchaseCapacity(game.data(),row.item,meta(row.item.itemType,row.id));
+      if (!capacity.remaining) {
+        capped=true;
+        report(`${title(row.item.itemType,row.id)} · 소지 한도 ${capacity.held}/${capacity.limit} · 구매 건너뜀`);
+        continue;
+      }
       if (attempted) {
         const until = Date.now()+1000+Math.floor(Math.random()*2001);
         while (Date.now() < until) { checkJob(job); await sleep(100); }
@@ -575,6 +601,8 @@
           checkJob(job);
           if (!settings.buy[choiceKey(item)]) break;
           const data = game.data(), before = game.stock(shop,id);
+          const capacity=purchaseCapacity(data,before.item || item,meta(type,id));
+          if (!capacity.remaining) { reason=`소지 한도 ${capacity.held}/${capacity.limit} · 추가 구매 건너뜀`; break; }
           if (!before.available) { reason='재고 부족'; break; }
           if (before.cycle !== initial.cycle) { reason='재입고 감지 · 다음 검사에서 계속'; break; }
           const price = before.item.coinPrice ?? meta(type,id).coinPrice;
@@ -586,18 +614,22 @@
           // Wait only for the authoritative acknowledgement and stock change.
           await game.command('PurchaseShopItem',{ shop,item:{ itemType:type,[FIELDS[type]]:id } },next => {
             const after = game.stock(shop,id);
-            return after.cycle === before.cycle && after.bought > before.bought;
+            return after.cycle === before.cycle && after.bought > before.bought &&
+              (!Number.isFinite(capacity.limit) || purchaseCapacity(next,item,meta(type,id)).held > capacity.held);
           });
           confirmed++;
         }
-      } catch(error) { reason=error.message; throw error; }
+      } catch(error) {
+        reason=error.message;
+        throw Error(`${title(type,id)} 구매 실패 (${shop}/${id}) · ${reason}`);
+      }
       finally {
         if (sent) notifyPurchase(type,id,sent,confirmed,reason);
         if(type==='Egg' && confirmed>0)schedulePlant();
         report(`${title(type,id)} · 구매 확인 ${confirmed}개${reason ? ` · ${reason}` : ''}`);
       }
     }
-    if (!attempted) report('상점 구매 대기 · 선택 품목 재고 없음');
+    if (!attempted && !capped) report('상점 구매 대기 · 선택 품목 재고 없음');
   }
   async function plant(job) {
     syncEggs(); let done=0;
