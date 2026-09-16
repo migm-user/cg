@@ -17,6 +17,8 @@
 // @connect      discord.com
 // @connect      raw.githubusercontent.com
 // @connect      *
+// @updateURL    https://raw.githubusercontent.com/migm-user/cg/main/Snail%20in%20Cherry.user.js
+// @downloadURL  https://raw.githubusercontent.com/migm-user/cg/main/Snail%20in%20Cherry.user.js
 // ==/UserScript==
 
 /* Protocol and geometry checked against the supplied Arie's Mod 3.2.214 and
