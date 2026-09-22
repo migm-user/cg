@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.2.3
+// @version      1.3.0
 // @description  독립 상점 구매·알 심기·부화·펫 판매와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -27,7 +27,7 @@
  * or creates a second game connection. CommonJS exports are for offline tests. */
 (function () {
   'use strict';
-  const VERSION = '1.2.3', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.3.0', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -38,11 +38,11 @@
   const quantity = item => finite(item?.quantity) ? Math.max(0, item.quantity) : 1;
   const itemId = item => String(item?.[FIELDS[item?.itemType]] || '');
   const choiceKey = item => `${item.itemType}:${itemId(item)}`;
-  // Public /data verified 2026-09-16; used only when catalog fields are absent.
+  // Public /data verified 2026-09-22; used only when catalog fields are absent.
   const TOOL_LIMIT_FALLBACK = {
     WateringCan:99,CropCleanser:99,ChilledPotion:99,FrozenPotion:99,
     ReplenishPotion:99,XPPotion:99,RainbowPotion:99,
-    WetPotion:1,DawnlitPotion:1,AmberlitPotion:1,GoldPotion:1,Shovel:1
+    WetPotion:1,DawnlitPotion:1,AmberlitPotion:1,GoldPotion:1,Shovel:1,Camera:1
   };
   function purchaseCapacity(data,item,metadata = {}) {
     const id=itemId(item), info={...metadata,...item};
@@ -53,9 +53,34 @@
       !own(info,'maxInventoryQuantity') && !own(info,'isOneTimePurchase') && item.itemType === 'Tool' ? TOOL_LIMIT_FALLBACK[id] ?? Infinity : Infinity;
     return {held,limit,remaining:Math.max(0,limit-held)};
   }
+  const STORAGE_FOR = { Seed:'SeedSilo',Tool:'ToolShack',Decor:'DecorShed' };
+  const storageItems = storage => Array.isArray(storage?.items) ? storage.items : [];
+  const storageCount = (storage,item) => storageItems(storage).reduce((sum,entry) =>
+    sum+(entry && (!entry.itemType || entry.itemType===item.itemType) && entry[FIELDS[item.itemType]]===itemId(item) ? quantity(entry) : 0),0);
+  function storagePlan(data,item,purchased,heldBefore,storageMeta = {}) {
+    const storageId=STORAGE_FOR[item.itemType];
+    if(!storageId)return {reason:''};
+    const storage=data.inventory?.storages?.find(s=>(s?.decorId || s?.id)===storageId);
+    if(!storage)return {reason:'보관함 없음 · 인벤토리 유지'};
+    const entries=(data.inventory.items || []).filter(i=>i?.itemType===item.itemType && itemId(i)===itemId(item));
+    const held=entries.reduce((n,i)=>n+quantity(i),0),amount=Math.min(purchased,Math.max(0,held-heldBefore));
+    if(amount<=0)return {reason:'구매 수량 확인 대기 · 인벤토리 유지'};
+    let slots=storage.capacitySlots;
+    if(!finite(slots)) {
+      const level=Number(storage.capacityLevel)||0;
+      slots=level>0 ? storageMeta.upgrades?.[level-1]?.toCapacitySlots : storageMeta.baseCapacitySlots;
+    }
+    if(!finite(slots))return {reason:'보관함 용량 확인 대기 · 인벤토리 유지'};
+    const stackable=item.itemType!=='Tool' || entries.some(i=>finite(i.quantity));
+    const merges=stackable && storageCount(storage,item)>0;
+    if(!merges && storageItems(storage).filter(Boolean).length>=slots)return {reason:'보관함 가득 참 · 인벤토리 유지'};
+    const entry=entries.find(i=>!i.locked && !(data.inventory.favoritedItemIds || []).includes(i.id || itemId(i)));
+    if(!entry)return {reason:'잠긴 품목 · 인벤토리 유지'};
+    return {storage,storageId,held,amount:Math.min(amount,quantity(entry)),itemKey:item.itemType==='Tool' ? entry.id || itemId(entry) : itemId(entry)};
+  }
   const defaults = () => ({
-    autoBuy: false, autoPlant: false, buy: {},
-    eggs: { order: [], enabled: {}, direction: '좌', zigzag: false },
+    autoBuy: false, autoStore: false, buy: {},
+    eggs: { order: [], enabled: {}, direction: '좌' },
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
     teams: { hatch: '', sell: '', restore: 'current' },
     webhook: { enabled: false, url: '' }, position: null, panelPosition: null, collapsedShops: []
@@ -69,7 +94,7 @@
         dst[key] = src[key];
       }
     };
-    for (const key of ['autoBuy', 'autoPlant']) bool(raw, key, s);
+    for (const key of ['autoBuy', 'autoStore']) bool(raw, key, s);
     for (const section of ['eggs', 'protect', 'teams', 'webhook']) {
       if (own(raw, section) && (!raw[section] || typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw Error(`${section}: 형식 오류`);
     }
@@ -91,9 +116,8 @@
       if (own(raw.eggs, 'enabled')) s.eggs.enabled = dict(raw.eggs.enabled);
       if (own(raw.eggs, 'direction')) {
         if (!['상','하','좌','우'].includes(raw.eggs.direction)) throw Error('심기 방향 오류');
-        s.eggs.direction = raw.eggs.direction;
+        s.eggs.direction = ['좌','우'].includes(raw.eggs.direction) ? raw.eggs.direction : '좌';
       }
-      bool(raw.eggs, 'zigzag', s.eggs);
     }
     if (raw.protect) {
       for (const key of ['gold','rainbow','str']) bool(raw.protect, key, s.protect);
@@ -135,22 +159,21 @@
     if (u.protocol !== 'https:' || u.hostname !== 'discord.com' || u.port || u.username || u.password || !/^\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+$/.test(u.pathname)) throw Error('Discord 웹후크 주소를 확인하세요.');
     u.search = '?wait=true'; u.hash = ''; return u.href;
   }
-  function orderedTiles(direction, zigzag, tiles = Array.from({ length: COLS * ROWS }, (_, i) => i)) {
-    const vertical = direction === '좌' || direction === '우';
+  function orderedTiles(direction, tiles = Array.from({ length: COLS * ROWS }, (_, i) => i)) {
     const groups = new Map();
     for (const tile of tiles) {
       if (!Number.isInteger(tile) || tile < 0 || tile >= COLS * ROWS) continue;
-      const major = vertical ? tile % COLS : Math.floor(tile / COLS);
+      const major = tile % COLS;
       if (!groups.has(major)) groups.set(major, []);
       groups.get(major).push(tile);
     }
-    const reverse = direction === '우' || direction === '하';
+    const reverse = direction === '우';
     const majors = [...groups.keys()].sort((a,b) => reverse ? b-a : a-b);
     // Alternation uses the physical row/column, even when an entire line is empty.
-    const total = vertical ? COLS : ROWS;
+    const total = COLS;
     return majors.flatMap(major => groups.get(major).sort((a,b) => {
       const rank = reverse ? total-1-major : major;
-      return zigzag && rank % 2 ? b-a : a-b;
+      return rank % 2 ? b-a : a-b;
     }));
   }
   function applyPatches(root, patches) {
@@ -386,7 +409,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,members,activeIds,sameIds,webhookURL,purchaseCapacity };
+  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -396,7 +419,7 @@
   let catalog = {}, catalogAt = 0, catalogPromise = null, catalogRetryAt = 0, catalogETag = '', running = null, status = '게임 연결 대기', view = 'home';
   let liveInfo={},liveAt=0,livePromise=null,liveRetryAt=0;
   let panel, content, footer, icon, shadow, lastPaint = 0, paintTimer=null;
-  const pendingBuy=new Set();let pendingPlant=false,drainTimer=null,draining=false,readyGeneration=-1;
+  const pendingBuy=new Set();let drainTimer=null,draining=false,readyGeneration=-1;
   let webhookQueue = Promise.resolve(), importNeedsTeams = false;
   const log = [];
   const save = () => GM_setValue(KEY,settings);
@@ -407,7 +430,7 @@
   }
   const game = new GameLink(page,(message,event) => {
     if (message) report(message);
-    if(!game.root) { pendingBuy.clear();pendingPlant=false;readyGeneration=-1;return; }
+    if(!game.root) { pendingBuy.clear();readyGeneration=-1;return; }
     let data;try{data=game.data();}catch{return;}
     if(readyGeneration!==game.generation) {
       readyGeneration=game.generation;validateTeamSettings();syncEggs();
@@ -415,8 +438,6 @@
     }
     if(importNeedsTeams)validateTeamSettings();
     if(event?.restocked?.length) { scheduleBuy(event.restocked);void loadCatalog();void loadLive(); }
-    // Purchase counters (not arbitrary inventory increases) also cover manual egg purchases.
-    if(event?.eggPurchases?.length && running?.kind!=='buy')schedulePlant();
     if(event?.uiChanged || event?.restocked?.length)schedulePaint();
     if (footer && footer.textContent!==status) footer.textContent = status;
   });
@@ -474,20 +495,12 @@
     report(`상점 구매 ${value?'On · 접속·재입고 때 확인':'Off'}`);
     if(value&&!was) {void loadCatalog();void loadLive();scheduleBuy();}
   }
-  function setAutoPlant(value) {
-    settings.autoPlant=value;if(!value)pendingPlant=false;
-    report(`알 심기 ${value?'On · 알 구매 완료 시 실행':'Off'}`);
-  }
   function scheduleBuy(shops=['*']) {
     if(!settings.autoBuy)return;
     for(const shop of shops)pendingBuy.add(shop);wakeAutomation();
   }
-  function schedulePlant() {
-    if(!settings.autoPlant)return;
-    pendingPlant=true;wakeAutomation();
-  }
   function wakeAutomation() {
-    if(drainTimer!==null || draining || running || !game.root || (!pendingBuy.size&&!pendingPlant))return;
+    if(drainTimer!==null || draining || running || !game.root || !pendingBuy.size)return;
     // Coalesce shop updates and multi-unit purchases arriving in one short burst.
     drainTimer=setTimeout(()=>{drainTimer=null;void drainAutomation();},200);
   }
@@ -495,10 +508,7 @@
     if(draining || running || !game.root)return;
     draining=true;
     try {
-      if(pendingPlant) {
-        pendingPlant=false;
-        if(settings.autoPlant)await run('plant',plant);
-      } else if(pendingBuy.size) {
+      if(pendingBuy.size) {
         const shops=new Set(pendingBuy);pendingBuy.clear();
         const generation=game.generation;
         if(settings.autoBuy) {await loadCatalog();if(settings.autoBuy && generation===game.generation)await run('buy',job=>buy(job,shops));}
@@ -561,7 +571,7 @@
   }
   function checkJob(job, restoring = false) {
     if (game.generation !== job.generation) throw Error('연결이 변경되어 작업을 중단했습니다.');
-    if (!restoring && (job.cancel || (job.kind === 'buy' && !settings.autoBuy) || (job.kind === 'plant' && !settings.autoPlant))) throw Error('작업 중지');
+    if (!restoring && (job.cancel || (job.kind === 'buy' && !settings.autoBuy))) throw Error('작업 중지');
     game.data();
   }
   async function run(kind,action) {
@@ -571,7 +581,6 @@
     try { game.data(); await action(job); }
     catch(error) {
       if (kind === 'buy') settings.autoBuy = false;
-      if (kind === 'plant') settings.autoPlant = false;
       save(); report(error.message);
     } finally { running = null; refresh();wakeAutomation(); }
   }
@@ -593,7 +602,8 @@
       }
       checkJob(job); attempted = true;
       const { shop,id,item } = row, type = item.itemType;
-      let sent=0,confirmed=0,reason='';
+      let sent=0,confirmed=0,reason='',storageNote='';
+      const heldBefore=purchaseCapacity(game.data(),item,meta(type,id)).held;
       const initial = game.stock(shop,id);
       const target = initial.available;
       try {
@@ -615,7 +625,7 @@
           await game.command('PurchaseShopItem',{ shop,item:{ itemType:type,[FIELDS[type]]:id } },next => {
             const after = game.stock(shop,id);
             return after.cycle === before.cycle && after.bought > before.bought &&
-              (!Number.isFinite(capacity.limit) || purchaseCapacity(next,item,meta(type,id)).held > capacity.held);
+              (!(Number.isFinite(capacity.limit) || settings.autoStore) || purchaseCapacity(next,item,meta(type,id)).held > capacity.held);
           });
           confirmed++;
         }
@@ -624,21 +634,24 @@
         throw Error(`${title(type,id)} 구매 실패 (${shop}/${id}) · ${reason}`);
       }
       finally {
+        if(settings.autoStore && confirmed>0 && !job.cancel && job.generation===game.generation) {
+          try { storageNote=await storePurchased(job,item,confirmed,heldBefore); }
+          catch(error) { storageNote=`보관함 이동 중단 · ${error.message}`; }
+        }
         if (sent) notifyPurchase(type,id,sent,confirmed,reason);
-        if(type==='Egg' && confirmed>0)schedulePlant();
-        report(`${title(type,id)} · 구매 확인 ${confirmed}개${reason ? ` · ${reason}` : ''}`);
+        report(`${title(type,id)} · 구매 확인 ${confirmed}개${reason ? ` · ${reason}` : ''}${storageNote ? ` · ${storageNote}` : ''}`);
       }
     }
     if (!attempted && !capped) report('상점 구매 대기 · 선택 품목 재고 없음');
   }
   async function plant(job) {
     syncEggs(); let done=0;
-    for (const slot of orderedTiles(settings.eggs.direction,settings.eggs.zigzag)) {
+    for (const slot of orderedTiles(settings.eggs.direction)) {
       checkJob(job);
       const data=game.data(), tiles=garden(data);
       if (tiles[slot]) continue;
       const id=settings.eggs.order.find(id => settings.eggs.enabled[id] && countEgg(data,id)>0);
-      if (!id) { report(`알 심기 대기 · 선택한 알 재고 없음${done ? ` · ${done}개 심음` : ''}`); return; }
+      if (!id) { report(`알 심기 종료 · 선택한 알 재고 없음${done ? ` · ${done}개 심음` : ''}`); return; }
       const before=countEgg(data,id);
       await game.command('GrowEgg',{ slot,eggId:id },next => {
         const tile=garden(next)[slot];
@@ -646,7 +659,22 @@
       });
       report(`알 심기 · ${++done}개 완료`);
     }
-    report(`알 심기 대기 · 밭에 빈칸 없음${done ? ` · ${done}개 심음` : ''}`);
+    report(`알 심기 종료 · 밭에 빈칸 없음${done ? ` · ${done}개 심음` : ''}`);
+  }
+  async function storePurchased(job,item,purchased,heldBefore) {
+    let moved=0;
+    while(moved<purchased && settings.autoStore) {
+      checkJob(job);
+      const plan=storagePlan(game.data(),item,purchased-moved,heldBefore,catalog.decor?.[STORAGE_FOR[item.itemType]]);
+      if(!plan.storage)return [moved?`보관함 ${moved}개 이동`:'',plan.reason].filter(Boolean).join(' · ');
+      const before=storageCount(plan.storage,item);
+      await game.command('PutItemInStorage',{itemId:plan.itemKey,storageId:plan.storageId,quantity:plan.amount},next=> {
+        const storage=next.inventory.storages?.find(s=>(s?.decorId || s?.id)===plan.storageId);
+        return storageCount(storage,item)>=before+plan.amount && purchaseCapacity(next,item).held<=plan.held-plan.amount;
+      },12000,{stateConfirms:true});
+      moved+=plan.amount;
+    }
+    return moved ? `보관함 ${moved}개 이동` : '';
   }
   async function applyTeam(id,job,restore = false) {
     if (!id) return;
@@ -675,7 +703,7 @@
   async function hatch(eggId = '') {
     await run('hatch',async job => {
       const initial=garden(game.data());
-      const slots=orderedTiles(settings.eggs.direction,settings.eggs.zigzag,Object.keys(initial).map(Number))
+      const slots=orderedTiles(settings.eggs.direction,Object.keys(initial).map(Number))
         .filter(slot => readyEgg(initial[slot]) && (!eggId || initial[slot].eggId === eggId))
         .map(slot => ({ slot, signature:JSON.stringify(initial[slot]) }));
       if (!slots.length) { report('부화 가능한 알이 없습니다.'); return; }
@@ -779,10 +807,13 @@
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
       for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['settings','설정','⚙️']]) {
-        const control=key==='buy'||key==='plant' ? switchFor(settings[key==='buy'?'autoBuy':'autoPlant'],v => key==='buy'?setAutoBuy(v):setAutoPlant(v),`${name} 자동 실행`) :
-          button(key==='hatch'?'부화':key==='sell'?'판매':'⚙️',() => key==='hatch'?hatchAll():key==='sell'?void sell():go('settings'),'pill');
+        const control=key==='buy' ? switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매') :
+          button(key==='plant'?'심기':key==='hatch'?'부화':key==='sell'?'판매':'⚙️',() => key==='plant'?void run('plant',plant):key==='hatch'?hatchAll():key==='sell'?void sell():go('settings'),'pill');
         content.append(el('div',{ class:'menu-row' },button(`${glyph}  ${name}`,()=>go(key),'menu-link'),control));
       }
+      content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...[
+        ['연화','Yeonhwa'],['채리','Cherry'],['혜','Hye']
+      ].map(([name,room])=>el('a',{text:name,href:`https://magicgarden.gg/r/${room.toLowerCase()}`,title:`${room} 방으로 이동`} ))));
     } else {
       if (view==='buy') renderBuy();
       if (view==='plant') renderPlant();
@@ -796,7 +827,8 @@
     placePanel();
   }
   function renderBuy() {
-    content.append(row('자동 구매',switchFor(settings.autoBuy,setAutoBuy,'자동 구매'),'접속·On 전환·재입고 때만 확인합니다. 품목 사이 1~3초 대기.'));
+    content.append(row('입고 시 구매',switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매'),'접속·On·재입고 때 확인 · 품목 사이 1~3초'),
+      row('보관함 자동 이동',switchFor(settings.autoStore,v=>settings.autoStore=v,'보관함 자동 이동'),'이 스크립트로 구매한 수량만 이동합니다.'));
     const rows=shopRows(), entries=new Map();
     for (const [type,source] of [['Seed',catalog.plants],['Egg',catalog.eggs],['Tool',catalog.items],['Decor',catalog.decor]]) {
       for (const id of Object.keys(source || {})) {
@@ -828,7 +860,13 @@
       if(Number.isFinite(nextAt))categoryBody.append(el('small',{text:`다음 갱신 ${new Date(nextAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})}${nextAt<Date.now()?' · 서버 갱신 확인 대기':''}`}));
       for (const {id} of group) {
         const key=`${type}:${id}`, available=rows.filter(r=>r.id===id && r.item.itemType===type).reduce((n,r)=>n+r.available,0);
-        categoryBody.append(el('div',{ class:'row' },itemLabel(type,id,`재고 ${available}개`),switchFor(!!settings.buy[key],v=>settings.buy[key]=v,`${title(type,id)} 구매`)));
+        let held='—',breakdown='';try{
+          const data=game.data(),item={itemType:type,[FIELDS[type]]:id},inventory=purchaseCapacity(data,item).held;
+          const stored=(data.inventory.storages || []).reduce((n,s)=>n+storageCount(s,item),0);
+          held=inventory+stored;breakdown=`인벤토리 ${inventory} · 보관함 ${stored}`;
+        }catch{}
+        const label=itemLabel(type,id,`재고 ${available} · 보유 ${held}`);label.title=breakdown;
+        categoryBody.append(el('div',{ class:'row' },label,switchFor(!!settings.buy[key],v=>settings.buy[key]=v,`${title(type,id)} 구매`)));
       }
       content.append(category);
     }
@@ -847,9 +885,8 @@
   }
   function renderPlant() {
     syncEggs();
-    content.append(row('자동 심기',switchFor(settings.autoPlant,setAutoPlant,'자동 심기'),'알 구매 완료 때만 실행합니다. 보유 알을 앞 종류부터 소진합니다.'),
-      row('시작 방향',select(settings.eggs.direction,['상','하','좌','우'].map(x=>[x,x]),v=>{settings.eggs.direction=v;refresh();},'밭 시작 방향')),
-      row('지그재그',switchFor(settings.eggs.zigzag,v=>{settings.eggs.zigzag=v;refresh();},'지그재그 심기와 부화'),'부화도 같은 방향과 순서를 사용합니다.'));
+    content.append(row('알 심기',button('심기',()=>void run('plant',plant),'primary'),'위쪽 알부터 소진 · 심기·부화는 지그재그 순서'),
+      row('시작 방향',select(settings.eggs.direction,['좌','우'].map(x=>[x,x]),v=>{settings.eggs.direction=v;refresh();},'밭 시작 방향')));
     let data;try{data=game.data();}catch{}
     for (const [index,id] of settings.eggs.order.entries()) {
       const r=el('div',{class:'row egg-row',draggable:true,ondragstart:e=>{dragEgg=id;e.dataTransfer.setData('text/plain',id);},ondragend:()=>{dragEgg='';},ondragover:e=>e.preventDefault(),ondrop:e=>{e.preventDefault();const from=dragEgg;dragEgg='';if(from)moveEgg(from,id);}},
@@ -915,7 +952,7 @@
   function importSettings(text) {
     if(running)throw Error('진행 중인 작업이 끝난 뒤 설정을 불러오세요.');
     const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;validateTeamSettings();save();syncEggs();placeIcon();refresh(true);report('모든 설정을 불러왔습니다.');
-    if(!settings.autoBuy)pendingBuy.clear();if(!settings.autoPlant)pendingPlant=false;
+    if(!settings.autoBuy)pendingBuy.clear();
     if(settings.autoBuy&&!wasBuy){void loadCatalog();void loadLive();scheduleBuy();}
   }
   function askRainbow(pets) {
@@ -970,16 +1007,17 @@
     const host=el('div',{id:'snail-in-cherry'});document.documentElement.append(host);shadow=host.attachShadow({mode:'open'});
     const style=el('style',{text:`
       :host{all:initial;color-scheme:dark;font:12px/1.45 system-ui,-apple-system,"Malgun Gothic",sans-serif;color:#e5e8e9}
-      *{box-sizing:border-box}[hidden]{display:none!important}button,input,select{font:inherit;color:inherit}button{cursor:pointer;border:1px solid #ffffff24;background:#ffffff07;border-radius:9px;padding:6px 10px;transition:background .12s}button:hover{background:#ffffff13;border-color:#ffffff40}button:disabled{opacity:.4;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid #6caf84;outline-offset:2px}
+      *{box-sizing:border-box}[hidden]{display:none!important}button,input,select{font:inherit;color:inherit}button{cursor:pointer;border:1px solid #ffffff24;background:#ffffff07;border-radius:5px;padding:5px 8px;transition:background .12s}button:hover{background:#ffffff13;border-color:#ffffff40}button:disabled{opacity:.4;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid #6caf84;outline-offset:2px}
       .icon{position:fixed;width:44px;height:44px;padding:0;border-radius:50%;background:#293229ed;color:#fff;font-size:24px;box-shadow:0 5px 18px #0005;z-index:2147483644;touch-action:none;user-select:none;cursor:grab}
-      .panel{position:fixed;right:76px;top:68px;width:390px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);display:flex;flex-direction:column;background:linear-gradient(135deg,#242821f5,#22262ef5);backdrop-filter:blur(16px);border:1px solid #ffffff1c;border-radius:14px;box-shadow:0 14px 40px #0005;z-index:2147483645;overflow:hidden}.panel.home{width:270px}
-      header{padding:12px 13px 0;flex:none;cursor:move;touch-action:none;user-select:none}.brand{display:flex;align-items:center;justify-content:space-between;gap:12px}.brand strong{font-size:14px;font-weight:650;flex:1;padding:5px 0;letter-spacing:-.2px}.brand button{font-size:19px;line-height:1;width:30px;height:30px;padding:0;color:#c7cccd;cursor:pointer}.badges{display:flex;align-items:center;gap:7px;margin:10px 0 11px}.badges span{font-size:11px;border:1px solid #4b8562;background:#32544044;border-radius:15px;padding:4px 8px;color:#e0eee5}.subhead{display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid #ffffff16;cursor:default}.page-name{flex:1;font-size:12px;color:#aeb8b4}.home .subhead{padding:0;border-top:0}.home .page-name{display:none}.back{font-size:11px;padding:4px 8px}.stop{font-size:11px;color:#f0c8c2;border-color:#8c635f;margin:5px 0}
-      .body{padding:0 13px 13px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#ffffff28 transparent;min-height:0}.home .body{padding:7px 13px 10px;border-top:1px solid #ffffff16}.menu-row{display:flex;align-items:center;min-height:40px;gap:12px}.menu-link{flex:1;text-align:left;background:none;border:0;font-weight:500;padding:9px 0;border-radius:4px}.menu-link:hover{background:#ffffff06}.pill{font-size:12px;min-width:49px;padding:5px 9px;border:1px solid #ffffff25;background:#ffffff06}
-      .row{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #ffffff0d}.grow{flex:1;min-width:0}.label{font-weight:500;overflow-wrap:anywhere}small{display:block;font-size:11px;color:#97a39f;line-height:1.6;margin-top:3px}p{font-size:12px;color:#b1bab7;margin:10px 0 12px}h3{font-size:12px;color:#b7c9bf;margin:18px 0 4px;font-weight:600}h2{font-size:17px;margin-top:0}
+      .panel{position:fixed;right:76px;top:68px;width:340px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);display:flex;flex-direction:column;background:linear-gradient(135deg,#242821f5,#22262ef5);backdrop-filter:blur(16px);border:1px solid #ffffff1c;border-radius:8px;box-shadow:0 14px 40px #0005;z-index:2147483645;overflow:hidden}.panel.home{width:224px}
+      header{padding:9px 10px 0;flex:none;cursor:move;touch-action:none;user-select:none}.brand{display:flex;align-items:center;justify-content:space-between;gap:8px}.brand strong{font-size:13px;font-weight:650;flex:1;padding:5px 0;letter-spacing:-.2px}.brand button{font-size:17px;line-height:1;width:25px;height:25px;padding:0;color:#c7cccd;cursor:pointer}.badges{display:flex;align-items:center;gap:7px;margin:6px 0 8px}.badges span{font-size:11px;border:1px solid #4b8562;background:#32544044;border-radius:5px;padding:2px 6px;color:#e0eee5}.subhead{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid #ffffff16;cursor:default}.page-name{flex:1;font-size:12px;color:#aeb8b4}.home .subhead{padding:0;border-top:0}.home .page-name{display:none}.back{font-size:11px;padding:4px 8px}.stop{font-size:11px;color:#f0c8c2;border-color:#8c635f;margin:5px 0}
+      .body{padding:0 10px 9px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#ffffff28 transparent;min-height:0}.home .body{padding:4px 10px 8px;border-top:1px solid #ffffff16}.menu-row{display:flex;align-items:center;min-height:34px;gap:8px}.menu-link{flex:1;text-align:left;background:none;border:0;font-weight:500;padding:6px 0;border-radius:4px}.menu-link:hover{background:#ffffff06}.pill{font-size:12px;min-width:43px;padding:4px 7px;border:1px solid #ffffff25;background:#ffffff06}
+      .row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #ffffff0d}.grow{flex:1;min-width:0}.label{font-weight:500;overflow-wrap:anywhere}small{display:block;font-size:11px;color:#97a39f;line-height:1.4;margin-top:2px}p{font-size:12px;color:#b1bab7;margin:7px 0 9px}h3{font-size:12px;color:#b7c9bf;margin:12px 0 4px;font-weight:600}h2{font-size:17px;margin-top:0}
+      .rooms{display:flex;gap:6px;padding-top:8px;margin-top:5px;border-top:1px solid #ffffff16}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
       .switch{display:inline-flex;flex:none;position:relative;width:35px;height:21px;cursor:pointer}.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.switch span{width:35px;height:21px;border-radius:12px;background:#ffffff24;pointer-events:none}.switch span:after{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#d7dedb;margin:3px;transition:transform .15s}.switch input:checked+span{background:#498060}.switch input:checked+span:after{transform:translateX(14px);background:#f1fff6}.switch input:focus-visible+span{outline:2px solid #6caf84;outline-offset:3px}
-      select,input:not([type=checkbox]){background:#161d1acc;border:1px solid #ffffff26;border-radius:7px;padding:7px;max-width:100%;min-width:0}select option{background:#252e29;color:#e5e8e9}.row select{max-width:195px}.row input[type=number]{width:84px}.body>input{width:100%;margin:8px 0}.body>button{margin:9px 6px 4px 0}.primary{background:#3e664b;border-color:#6a9876;color:#f2fff6}.primary:hover{background:#4a775a}.item{display:flex;align-items:center;gap:9px;flex:1;min-width:0}.item img,.fallback{width:29px;height:29px;object-fit:contain;image-rendering:pixelated;flex:none}.fallback{text-align:center;line-height:29px}.grip{color:#88998f;cursor:grab;user-select:none}.arrows{display:flex;flex-direction:column;gap:2px}.arrows button{font-size:10px;padding:0 5px;border-radius:4px}
-      .shop-category{margin-top:10px;border:1px solid #ffffff1b;border-radius:9px;overflow:hidden}.shop-category summary{cursor:pointer;display:flex;align-items:center;gap:7px;padding:10px;background:#ffffff05;list-style:none;font-weight:600;user-select:none}.shop-category summary::-webkit-details-marker{display:none}.shop-category summary:before{content:'›';font-size:17px;line-height:1;color:#9eaea4;transition:transform .12s}.shop-category[open] summary:before{transform:rotate(90deg)}.shop-category summary small{margin:0 0 0 auto;font-size:10px;font-weight:400}.category-body{padding:0 10px}.category-body .row:last-child{border-bottom:0}
-      .summary{padding:11px;background:#ffffff08;border:1px solid #ffffff13;border-radius:8px;margin:12px 0}footer{padding:9px 13px;border-top:1px solid #ffffff16;font-size:10px;color:#a7b7ad;background:#00000012;overflow-wrap:anywhere;flex:none;max-height:75px;overflow:auto}pre{white-space:pre-wrap;font-size:10px;line-height:1.8;color:#99aaa0;max-height:160px;overflow:auto}.overlay{position:fixed;inset:0;background:#10171299;display:grid;place-items:center;z-index:2147483646}.dialog{background:#262e28;border:1px solid #ffffff24;border-radius:13px;padding:20px;width:370px;max-width:calc(100vw - 24px);box-shadow:0 20px 80px #0007}.dialog ul{max-height:200px;overflow:auto;padding-left:20px}.actions{display:flex;justify-content:flex-end;gap:8px}@media(max-width:520px){.panel{max-height:calc(100dvh - 16px)}.body{padding:0 12px 12px}.row select{max-width:170px}}
+      select,input:not([type=checkbox]){background:#161d1acc;border:1px solid #ffffff26;border-radius:4px;padding:5px;max-width:100%;min-width:0}select option{background:#252e29;color:#e5e8e9}.row select{max-width:175px}.row input[type=number]{width:84px}.body>input{width:100%;margin:8px 0}.body>button{margin:6px 5px 3px 0}.primary{background:#3e664b;border-color:#6a9876;color:#f2fff6}.primary:hover{background:#4a775a}.item{display:flex;align-items:center;gap:9px;flex:1;min-width:0}.item img,.fallback{width:25px;height:25px;object-fit:contain;image-rendering:pixelated;flex:none}.fallback{text-align:center;line-height:25px}.grip{color:#88998f;cursor:grab;user-select:none}.arrows{display:flex;flex-direction:column;gap:2px}.arrows button{font-size:10px;padding:0 5px;border-radius:4px}
+      .shop-category{margin-top:7px;border:1px solid #ffffff1b;border-radius:5px;overflow:hidden}.shop-category summary{cursor:pointer;display:flex;align-items:center;gap:7px;padding:7px 8px;background:#ffffff05;list-style:none;font-weight:600;user-select:none}.shop-category summary::-webkit-details-marker{display:none}.shop-category summary:before{content:'›';font-size:17px;line-height:1;color:#9eaea4;transition:transform .12s}.shop-category[open] summary:before{transform:rotate(90deg)}.shop-category summary small{margin:0 0 0 auto;font-size:10px;font-weight:400}.category-body{padding:0 8px}.category-body .row:last-child{border-bottom:0}
+      .summary{padding:8px;background:#ffffff08;border:1px solid #ffffff13;border-radius:5px;margin:8px 0}footer{padding:6px 10px;border-top:1px solid #ffffff16;font-size:10px;color:#a7b7ad;background:#00000012;overflow-wrap:anywhere;flex:none;max-height:75px;overflow:auto}pre{white-space:pre-wrap;font-size:10px;line-height:1.8;color:#99aaa0;max-height:160px;overflow:auto}.overlay{position:fixed;inset:0;background:#10171299;display:grid;place-items:center;z-index:2147483646}.dialog{background:#262e28;border:1px solid #ffffff24;border-radius:8px;padding:15px;width:370px;max-width:calc(100vw - 24px);box-shadow:0 20px 80px #0007}.dialog ul{max-height:200px;overflow:auto;padding-left:20px}.actions{display:flex;justify-content:flex-end;gap:8px}@media(max-width:520px){.panel{max-height:calc(100dvh - 16px)}.body{padding:0 10px 9px}.row select{max-width:170px}}
     `});
     icon=button('🐌',()=>{panel.hidden=!panel.hidden;if(!panel.hidden)refresh();},'icon');icon.setAttribute('aria-label','Snail in Cherry 열기');
     icon.onclick=null;
