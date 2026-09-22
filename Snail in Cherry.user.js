@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.4
+// @version      1.4.5
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -21,13 +21,14 @@
 // @downloadURL  https://raw.githubusercontent.com/migm-user/cg/main/Snail%20in%20Cherry.user.js
 // ==/UserScript==
 
-/* Protocol and geometry checked against the supplied Arie's Mod 3.2.214 and
+/* Protocol and geometry checked against the supplied Arie's Mod 3.2.217 and
  * MG-AFK-Portable sources. No other mod, local server or injected atom store is
  * required. This file observes the game's existing connection; it never logs in
- * or creates a second game connection. CommonJS exports are for offline tests. */
+ * or creates a second game connection. Native team reads use the game's own
+ * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.4', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.5', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -231,10 +232,14 @@
   function mySlot(root, selfId) {
     const slots = root?.child?.data?.userSlots;
     if (!selfId || !Array.isArray(slots)) return null;
-    const player = root.data?.players?.find(p => p?.id === selfId);
-    const db = [player?.databaseUserId, player?.discordUserId].filter(x => x != null).map(String);
-    return slots.find(s => s && (s.playerId === selfId || s.userId === selfId || s.data?.playerId === selfId)) ||
-      slots.find(s => s && [s.databaseUserId,s.discordUserId,s.data?.databaseUserId,s.data?.discordUserId,s.data?.userId].some(v => v != null && db.includes(String(v)))) || null;
+    const ids=source=>[source,source?.data].filter(Boolean).flatMap(o=>['userId','id','discordUserId','databaseUserId','playerId']
+      .map(key=>o[key]).filter(v=>typeof v==='string'&&v.trim() || finite(v)).map(String));
+    const direct=slots.filter(s=>s && ids(s).includes(String(selfId)));
+    if(direct.length)return direct.length===1?direct[0]:null;
+    const player=root.data?.players?.find(p=>String(p?.id)===String(selfId));
+    const accounts=new Set(ids(player).filter(id=>id!==String(selfId) && !id.startsWith('p_')));
+    const matches=slots.filter(s=>s && ids(s).some(id=>accounts.has(id)));
+    return matches.length===1?matches[0]:null;
   }
   function maxStrength(pet, catalog) {
     const entry = catalog?.pets?.[pet?.petSpecies];
@@ -278,6 +283,66 @@
     const ids=members(team);
     if(!Array.isArray(team.members) || ids.length!==team.members.length || !ids.length || ids.length>3 || new Set(ids).size!==ids.length)throw Error('선택한 펫 팀의 구성원을 확인할 수 없습니다.');
     return team;
+  }
+  class NativeGameTeams {
+    constructor(page,changed=()=>{}) {this.page=page;this.changed=changed;this.get=null;this.pending=null;this.lastTeams=null;this.unsub=[];}
+    atom(label) {
+      const cache=this.page.jotaiAtomCache?.cache;
+      if(!cache?.entries)return null;
+      for(const [key,atom] of cache.entries())if(atom && (atom.debugLabel===label || atom.label===label || String(key).endsWith('/'+label)))return atom;
+      return null;
+    }
+    read(selfId,roomState) {
+      if(!this.get)return null;
+      try {
+        const state=this.atom('stateAtom'),player=this.atom('playerAtom');if(!state)return null;
+        const root=this.get(state),me=player?this.get(player):null;
+        if(me?.id && selfId && String(me.id)!==String(selfId))return null;
+        if(root?.data?.roomSessionId && roomState?.data?.roomSessionId && root.data.roomSessionId!==roomState.data.roomSessionId)return null;
+        return nativeTeams(mySlot(root,me?.id || selfId)?.data);
+      }catch{return null;}
+    }
+    async connect() {
+      if(this.get)return true;
+      if(this.pending)return this.pending;
+      this.pending=this.capture().finally(()=>{this.pending=null;});return this.pending;
+    }
+    async capture() {
+      const cache=this.page.jotaiAtomCache?.cache;if(!cache?.values || !this.atom('stateAtom'))return false;
+      // Same native stateAtom/playerAtom path used by Arie's server-team watcher.
+      // Discover a real game store, without reading Arie's globals or saved settings.
+      const hook=this.page.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+      for(const [id] of hook?.renderers || [])for(const root of hook.getFiberRoots?.(id) || []) {
+        const stack=[root.current],seen=new Set();
+        while(stack.length && seen.size<10000) {
+          const fiber=stack.pop();if(!fiber || seen.has(fiber))continue;seen.add(fiber);
+          for(const store of [fiber.pendingProps?.value,fiber.memoizedProps?.value])if(typeof store?.get==='function' && typeof store.sub==='function') {
+            this.get=atom=>store.get(atom);
+            const changed=()=>{const teams=this.read();const signature=JSON.stringify(teams);if(signature!==this.lastTeams){this.lastTeams=signature;this.changed();}};
+            for(const atom of [this.atom('stateAtom'),this.atom('playerAtom')].filter(Boolean))this.unsub.push(store.sub(atom,changed));
+            return true;
+          }
+          stack.push(fiber.child,fiber.sibling,fiber.alternate);
+        }
+      }
+      // Capture only the read accessor during one normal game write, then restore
+      // every wrapper. No synthetic game writes and no permanent polling interval.
+      return new Promise(resolve=>{
+        const patches=[];let settled=false;
+        const finish=get=>{
+          if(settled)return;settled=true;clearTimeout(timer);
+          for(const [atom,original,wrapped] of patches)if(atom.write===wrapped)atom.write=original;
+          if(get)this.get=get;resolve(!!get);
+        };
+        const timer=setTimeout(()=>finish(null),1500);
+        for(const atom of cache.values())if(typeof atom?.write==='function') {
+          const original=atom.write;
+          const wrapped=function(get,...args){finish(get);return original.call(this,get,...args);};
+          try{atom.write=wrapped;if(atom.write===wrapped)patches.push([atom,original,wrapped]);}catch{}
+        }
+        if(!patches.length)finish(null);
+      });
+    }
   }
   const activeIds = data => (Array.isArray(data?.petSlots) ? data.petSlots : []).map(p => String(p?.id || '')).filter(Boolean).sort();
   const sameIds = (a,b) => a.length === b.length && a.every((v,i) => v === b[i]);
@@ -420,9 +485,10 @@
       const patches = msg.type === 'RoomFrame' ? msg.state?.patches : msg.type === 'PartialState' ? msg.patches : null;
       if (this.root && Array.isArray(patches)) {
         this.root = applyPatches(this.root,patches); this.revision++;
-        const relevant=patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/shops(?:\/|$)/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/(inventory|garden|petTeams|petSlots|coinsCount|shopPurchases)(?:\/|$)/.test(p.path));
+        const identityChanged=patches.some(p=>/^\/data(?:\/players(?:\/|$)|$)/.test(p.path) || /^\/child\/data\/userSlots\/\d+(?:\/data)?\/(id|userId|playerId|discordUserId|databaseUserId)(?:\/|$)/.test(p.path));
+        const relevant=identityChanged || patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/shops(?:\/|$)/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/(inventory|garden|petTeams|petSlots|coinsCount|shopPurchases)(?:\/|$)/.test(p.path));
         if(relevant) {
-          const shopsChanged=patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/shops(?:\/|$)/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /\/shopPurchases(?:\/|$)/.test(p.path));
+          const shopsChanged=identityChanged || patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/shops(?:\/|$)/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /\/shopPurchases(?:\/|$)/.test(p.path));
           const events=shopsChanged?this.observeShops():{restocked:[],eggPurchases:[]};
           const uiChanged=patches.some(p=>!p.path.endsWith('/secondsUntilRestock'));
           const feedChanged=patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/(inventory|petSlots)(?:\/|$)/.test(p.path));
@@ -492,7 +558,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -514,7 +580,7 @@
   }
   const game = new GameLink(page,(message,event) => {
     if (message) report(message);
-    if(!game.root) { pendingBuy.clear();clearFeeding();readyGeneration=-1;return; }
+    if(!game.root) { pendingBuy.clear();clearFeeding();readyGeneration=-1;schedulePaint();return; }
     let data;try{data=game.data();}catch{return;}
     if(readyGeneration!==game.generation) {
       readyGeneration=game.generation;syncEggs();
@@ -526,6 +592,7 @@
     if (footer && footer.textContent!==status) footer.textContent = status;
   });
   game.install();
+  const nativeGameTeams=new NativeGameTeams(page,schedulePaint);
   function request(url, options = {}) {
     return new Promise((resolve,reject) => {
       GM_xmlhttpRequest({ method: options.method || 'GET', url, anonymous: true, timeout: 15000,
@@ -708,8 +775,7 @@
     running = job; refresh();
     try { game.data(); await action(job); }
     catch(error) {
-      if (kind === 'buy') settings.autoBuy = false;
-      save(); report(error.message);
+      report(error.message+(kind==='buy' && settings.autoBuy?' · 입고 시 구매 On 유지 · 다음 입고·재접속 때 재확인':''));
     } finally { running = null; observeFeed();refresh();wakeAutomation(); }
   }
   async function feedPet(job,entry) {
@@ -911,14 +977,15 @@
   async function applyTeam(id,job,restore = false) {
     if (!id) return;
     checkJob(job,restore);
-    const data=game.data(), team=requireTeam(data,id);
+    const data=game.data(), team=requireTeam({...data,petTeams:teamSnapshot()},id);
     const ids=members(team);
     if (sameIds(activeIds(data),ids)) return;
     report(`${restore ? '프리셋 복구' : '프리셋 적용'} · ${team.name || id}`);
     await game.command('ApplyPetTeam',{ teamId:id },next => sameIds(activeIds(next),ids),12000,{stateConfirms:true});
   }
   async function withTeam(kind,job,action) {
-    const data=game.data(), target=settings.teams[kind];
+    await nativeGameTeams.connect();checkJob(job);
+    const data={...game.data(),petTeams:teamSnapshot()}, target=settings.teams[kind];
     const original=(nativeTeams(data) || []).find(t => sameIds(members(t),activeIds(data)));
     const restore=settings.teams.restore === 'current' ? String(original?.id || '') : settings.teams.restore;
     if (target && settings.teams.restore === 'current' && !restore) throw Error('현재 구성이 저장된 펫 팀과 일치하지 않습니다. 게임에서 팀을 저장하거나 복구 팀을 선택하세요.');
@@ -1030,9 +1097,12 @@
   }
   function go(next) {
     dragEgg=''; shadow?.activeElement?.blur(); view=next; refresh(true);
+    if(next==='settings')void refreshNativeTeams();
   }
   function refresh(force = false) {
     if (!content) return;
+    shadow.querySelector('.connection').textContent=game.root?'● 연결됨':'○ 연결 대기';
+    shadow.querySelector('.stop').hidden=!running;
     // Team options must still follow server patches while a select or text field
     // has focus. Update these controls in place without discarding the user's edit.
     if(view==='settings')syncTeamControls();
@@ -1061,8 +1131,6 @@
       if (view==='settings') renderSettings();
     }
     if(footer.textContent!==status)footer.textContent=status;
-    shadow.querySelector('.connection').textContent=game.root?'● 연결됨':'○ 연결 대기';
-    shadow.querySelector('.stop').hidden=!running;
     placePanel();
   }
   function renderBuy() {
@@ -1201,7 +1269,14 @@
       }}));
   }
   function teamSnapshot() {
-    try{return nativeTeams(game.data());}catch{return null;}
+    if(!game.root || game.socket?.readyState!==1)return null;
+    const native=nativeGameTeams.read(game.selfId,game.root);
+    if(native!==null)return native;
+    return nativeTeams(mySlot(game.root,game.selfId)?.data);
+  }
+  async function refreshNativeTeams() {
+    await nativeGameTeams.connect();
+    if(view==='settings')report(syncTeamControls());
   }
   function teamOptions(key,teams) {
     const options=(teams || []).map(t=>[t.id,typeof t.name==='string' && t.name.trim()?t.name:t.id]);
@@ -1229,7 +1304,7 @@
       const opts=teamOptions(key,teams),node=select(settings.teams[key],opts,v=>{settings.teams[key]=v;syncTeamControls();},name);
       node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
     }
-    content.append(el('small',{class:'team-status'}),button('팀 목록 새로고침',()=>report(syncTeamControls())));
+    content.append(el('small',{class:'team-status'}),button('팀 목록 새로고침',()=>void refreshNativeTeams()));
     syncTeamControls();
     content.append(el('small',{text:'현재 프리셋은 실행 직전의 게임 펫 팀입니다. 복구도 게임 팀 변경 기능을 사용합니다.'}),el('h3',{text:'설정 백업'}));
     content.append(button('모든 설정 파일로 저장',exportSettings,'primary'),el('small',{text:'웹후크 주소, On/Off 상태와 아이콘 위치도 파일에 포함됩니다.'}));
@@ -1340,7 +1415,7 @@
     panel=el('section',{class:'panel',hidden:true,ariaLabel:'Snail in Cherry'},el('header',{},
       el('div',{class:'brand'},el('strong',{text:'Snail in Cherry',class:'title-handle',title:'드래그하여 창 이동'}),button('×',()=>panel.hidden=true)),
       el('div',{class:'badges'},el('span',{class:'connection',text:'○ 연결 대기'}),el('span',{class:'version',text:VERSION})),
-      el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}),button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed'){setAutoFeed(false);save();}}report('현재 요청 확인 후 중지합니다.');},'stop'))),content,footer);
+      el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}),button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed')setAutoFeed(false);if(running.kind==='buy')setAutoBuy(false);save();}report('현재 요청 확인 후 중지합니다.');},'stop'))),content,footer);
     enablePanelDrag(panel.querySelector('header'));
     shadow.append(style,icon,panel);placeIcon();window.addEventListener('resize',()=>{placeIcon();placePanel();});refresh();void loadCatalog();
   }
