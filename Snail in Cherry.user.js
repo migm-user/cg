@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.2
+// @version      1.4.3
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -27,7 +27,7 @@
  * or creates a second game connection. CommonJS exports are for offline tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.2', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.3', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -80,7 +80,7 @@
   }
   const defaults = () => ({
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
-    feed: { allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
+    feed: { hungerPotion:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
     teams: { hatch: '', sell: '', restore: 'current' },
@@ -110,6 +110,7 @@
     };
     if (own(raw, 'buy')) s.buy = dict(raw.buy);
     if(raw.feed) {
+      bool(raw.feed,'hungerPotion',s.feed);
       if(own(raw.feed,'allowed'))s.feed.allowed=dict(raw.feed.allowed);
       for(const key of ['openEggs','openPets'])if(own(raw.feed,key)) {
         if(!Array.isArray(raw.feed[key]) || raw.feed[key].length>1000 || raw.feed[key].some(v=>typeof v!=='string'||!/^[\w:.-]{1,160}$/.test(v)))throw Error('펫 먹이 접기 설정 오류');
@@ -296,7 +297,8 @@
     return groups;
   }
   const foodKey = (species,type,id) => `${species}:${type}:${id}`;
-  const foodAllowed = (settings,species,type,id) => settings.feed.allowed[foodKey(species,type,id)]!==false;
+  const foodAllowed = (settings,species,type,id) =>
+    !(type==='Tool' && id==='ReplenishPotion' && settings.feed.hungerPotion===false) && settings.feed.allowed[foodKey(species,type,id)]!==false;
   function chooseFood(data,pet,catalog,settings) {
     const diet=catalog.pets?.[pet.petSpecies]?.diet;
     if(!Array.isArray(diet))return null;
@@ -727,6 +729,30 @@
     }
     let unlockedId=null;
     let food=selected.item;
+    const canFeedSelected=()=> {
+      checkJob(job);pet=current();
+      if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return false;
+      if(foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return true;
+      if(state){state.complete=false;state.waiting=true;}
+      notice('급식 취소','먹이 선택 변경 · 선택한 먹이 급식 취소');
+      return false;
+    };
+    let moveDeadline=0,moves=0;
+    async function preparePotion() {
+      // /data supplies item metadata, not use requirements. Confirm the live game's
+      // co-location requirement before and after unlocking; never chase a pet indefinitely.
+      if(!moveDeadline)moveDeadline=Date.now()+8000;
+      while(true) {
+        if(!canFeedSelected())return false;
+        const position=petPosition(game.data(),entry.id,game.serverNow());
+        if(position && samePoint(game.data().position,position))return true;
+        if(Date.now()>=moveDeadline)throw Error('펫 위치·이동 확인 대기 · 포션 미사용');
+        if(!position){await sleep(100);continue;}
+        if(moves>=2)throw Error('펫이 계속 이동하여 포션 사용 보류');
+        moves++;
+        await game.command('Teleport',{position},next=>samePoint(next.position,position),moveDeadline-Date.now(),{flat:true,stateConfirms:true});
+      }
+    }
     try {
       checkJob(job);
       if(selected.storageId) {
@@ -744,21 +770,10 @@
         food=game.data().inventory.items.find(i=>food.itemType==='Tool'?i?.toolId===food.toolId:i?.id===food.id);
         if(!food)throw Error('꺼낸 먹이 확인 실패');
       }
-      checkJob(job);pet=current();
-      if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
-      if(!foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return;
+      if(!canFeedSelected())return;
       if(foodLocked(game.data().inventory,food) && (typeof food.id!=='string' || !food.id))throw Error('먹이 개별 ID 확인 대기 · 잠금 유지');
-      if(food.itemType==='Tool') {
-        // Potion use needs the player on the pet's current tile. Teleport is a flat game message.
-        const deadline=Date.now()+8000;let position;
-        while(!(position=petPosition(game.data(),entry.id,game.serverNow())) && Date.now()<deadline){checkJob(job);await sleep(100);}
-        if(!position)throw Error('펫 위치 확인 대기 · 포션 미사용');
-        if(!samePoint(game.data().position,position))await game.command('Teleport',{position},next=>samePoint(next.position,position),8000,{flat:true,stateConfirms:true});
-        if(!samePoint(game.data().position,petPosition(game.data(),entry.id,game.serverNow())))throw Error('펫이 이동하여 포션 사용 보류');
-      }
-      checkJob(job);pet=current();
-      if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
-      if(!foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return;
+      if(food.itemType==='Tool' && !await preparePotion())return;
+      if(!canFeedSelected())return;
       // Only the selected item's own ID may be unlocked; species/tool IDs are never lock keys.
       const inv=game.data().inventory;
       if(!Array.isArray(inv.favoritedItemIds))throw Error('먹이 잠금 정보 확인 대기');
@@ -772,10 +787,10 @@
           return !!selected && !foodLocked(next.inventory,selected);
         },12000,{stateConfirms:true});
       }
-      checkJob(job);pet=current();
-      if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
-      if(!foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return;
+      if(food.itemType==='Tool' && !await preparePotion())return;
+      if(!canFeedSelected())return;
       const dataBefore=game.data(),potion=food.itemType==='Tool';
+      if(potion && !samePoint(dataBefore.position,petPosition(dataBefore,entry.id,game.serverNow())))throw Error('펫이 이동하여 포션 사용 보류');
       const selectedNow=dataBefore.inventory.items.find(i=>potion?i?.itemType==='Tool' && i.toolId===food.toolId:i?.id===food.id);
       if(!selectedNow || (food.id && selectedNow.id!==food.id) || quantity(selectedNow)<=0 || foodLocked(dataBefore.inventory,selectedNow))throw Error('먹이 수량·잠금·선택 변경 · 급식 보류');
       const countSelected=next=>food.id ? quantity(next.inventory.items.find(i=>i?.id===food.id) || {quantity:0}) : purchaseCapacity(next,food).held;
@@ -1140,7 +1155,10 @@
   }
   function renderFeed() {
     content.append(row('펫 먹이',switchFor(settings.autoFeed,setAutoFeed,'펫 먹이 자동 지급'),'사용 중인 펫 · 배고픔 5% 미만'),
-      el('small',{text:'알림 후 1~5초 대기 · 여러 펫은 2초 간격 · 일반 먹이 우선, 없으면 Hunger Potion'}),
+      row('Hunger Potion 전체 허용',switchFor(settings.feed.hungerPotion,v=>{
+        settings.feed.hungerPotion=v;observeFeed();refresh(true);
+      },'Hunger Potion 전체 허용'),'Off이면 모든 동물에게 포션 지급 제외 · 개별 선택 유지'),
+      el('small',{text:'알림 후 1~5초 대기 · 여러 펫은 2초 간격 · 일반 먹이 우선, 허용한 포션만 사용'}),
       el('small',{text:'선택한 먹이만 잠금 해제하고, 남아 있으면 다시 잠급니다.'}));
     const groups=petFoodGroups(catalog);
     if(!groups.length)content.append(el('p',{text:'동물과 먹이 정보를 불러오는 중입니다.'}));
@@ -1163,9 +1181,11 @@
         const diet=[...new Set(catalog.pets?.[species]?.diet || [])];
         for(const [type,id] of [...diet.map(id=>['Produce',id]),['Tool','ReplenishPotion']]) {
           const key=foodKey(species,type,id);
-          animal.append(el('div',{class:'row'},itemLabel(type,id,''),switchFor(settings.feed.allowed[key]!==false,v=>{
+          const toggle=switchFor(foodAllowed(settings,species,type,id),v=>{
             settings.feed.allowed[key]=v;observeFeed();
-          },`${title('Pet',species)} · ${title(type,id)} 먹이`)));
+          },`${title('Pet',species)} · ${title(type,id)} 먹이`);
+          if(type==='Tool' && id==='ReplenishPotion' && !settings.feed.hungerPotion)toggle.querySelector('input').disabled=true;
+          animal.append(el('div',{class:'row'},itemLabel(type,id,''),toggle));
         }
         body.append(animal);
       }
