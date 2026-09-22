@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.3
+// @version      1.4.4
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -27,7 +27,7 @@
  * or creates a second game connection. CommonJS exports are for offline tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.3', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.4', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -270,6 +270,15 @@
     return { item, bought, available: item && finite(item.initialStock) ? Math.max(0,item.initialStock-bought) : 0, epoch: Number(record?.createdAt || 0) };
   }
   const members = team => (Array.isArray(team?.members) ? team.members : []).map(m => String(m?.petId || '')).filter(Boolean).sort();
+  // Native v1240 teams are part of the current player's authoritative data.
+  const nativeTeams = data => Array.isArray(data?.petTeams) ? data.petTeams.filter(t=>t && typeof t.id==='string' && t.id.trim()) : null;
+  function requireTeam(data,id) {
+    const team=nativeTeams(data)?.find(t=>t.id===id);
+    if(!team)throw Error('선택한 펫 팀을 찾을 수 없습니다. 설정에서 팀 목록을 확인하세요.');
+    const ids=members(team);
+    if(!Array.isArray(team.members) || ids.length!==team.members.length || !ids.length || ids.length>3 || new Set(ids).size!==ids.length)throw Error('선택한 펫 팀의 구성원을 확인할 수 없습니다.');
+    return team;
+  }
   const activeIds = data => (Array.isArray(data?.petSlots) ? data.petSlots : []).map(p => String(p?.id || '')).filter(Boolean).sort();
   const sameIds = (a,b) => a.length === b.length && a.every((v,i) => v === b[i]);
   const FEED_THRESHOLD=5;
@@ -495,7 +504,7 @@
   let panel, content, footer, icon, shadow, lastPaint = 0, paintTimer=null;
   const pendingBuy=new Set();let drainTimer=null,draining=false,readyGeneration=-1;
   const pendingFeed=new Map(),feedStates=new Map();let feedTimer=null,lastFeedAt=0;
-  let webhookQueue = Promise.resolve(), importNeedsTeams = false;
+  let webhookQueue = Promise.resolve();
   const log = [];
   const save = () => GM_setValue(KEY,settings);
   function report(message) {
@@ -508,10 +517,9 @@
     if(!game.root) { pendingBuy.clear();clearFeeding();readyGeneration=-1;return; }
     let data;try{data=game.data();}catch{return;}
     if(readyGeneration!==game.generation) {
-      readyGeneration=game.generation;validateTeamSettings();syncEggs();
+      readyGeneration=game.generation;syncEggs();
       void loadCatalog().then(observeFeed);void loadLive();scheduleBuy();schedulePaint();return;
     }
-    if(importNeedsTeams)validateTeamSettings();
     if(event?.restocked?.length) { scheduleBuy(event.restocked);void loadCatalog();void loadLive(); }
     if(event?.feedChanged)observeFeed();
     if(event?.uiChanged || event?.restocked?.length)schedulePaint();
@@ -683,17 +691,6 @@
     let changed = false;
     for (const id of all) if (id && !settings.eggs.order.includes(id)) { settings.eggs.order.push(id); changed = true; }
     if (changed) save();
-  }
-  function validateTeamSettings() {
-    let teams; try { teams = game.data().petTeams; } catch { importNeedsTeams = true; return; }
-    if (!Array.isArray(teams)) { importNeedsTeams = true; return; }
-    const ids = new Set(teams.map(t => String(t.id))); let changed = false;
-    for (const key of ['hatch','sell','restore']) {
-      const id = settings.teams[key];
-      if (id && !(key === 'restore' && id === 'current') && !ids.has(id)) { settings.teams[key] = key === 'restore' ? 'current' : ''; changed = true; }
-    }
-    importNeedsTeams = false;
-    if (changed) { save(); report('존재하지 않는 펫 팀 설정을 해제했습니다.'); }
   }
   const countEgg = (data,id) => data.inventory.items.reduce((n,i) => n+(i?.itemType === 'Egg' && i.eggId === id ? quantity(i) : 0),0);
   function garden(data) {
@@ -914,8 +911,7 @@
   async function applyTeam(id,job,restore = false) {
     if (!id) return;
     checkJob(job,restore);
-    const data=game.data(), team=data.petTeams?.find(t => String(t.id) === id);
-    if (!team || !Array.isArray(team.members)) throw Error('선택한 펫 팀이 없습니다.');
+    const data=game.data(), team=requireTeam(data,id);
     const ids=members(team);
     if (sameIds(activeIds(data),ids)) return;
     report(`${restore ? '프리셋 복구' : '프리셋 적용'} · ${team.name || id}`);
@@ -923,9 +919,13 @@
   }
   async function withTeam(kind,job,action) {
     const data=game.data(), target=settings.teams[kind];
-    const original=(data.petTeams || []).find(t => sameIds(members(t),activeIds(data)));
+    const original=(nativeTeams(data) || []).find(t => sameIds(members(t),activeIds(data)));
     const restore=settings.teams.restore === 'current' ? String(original?.id || '') : settings.teams.restore;
     if (target && settings.teams.restore === 'current' && !restore) throw Error('현재 구성이 저장된 펫 팀과 일치하지 않습니다. 게임에서 팀을 저장하거나 복구 팀을 선택하세요.');
+    // Keep saved selections through initial/delayed snapshots, but never run an
+    // action when its target or recovery team is unavailable.
+    if(target)requireTeam(data,target);
+    if(restore)requireTeam(data,restore);
     let changed=false;
     try {
       if (target) { changed=true; await applyTeam(target,job); }
@@ -1033,6 +1033,9 @@
   }
   function refresh(force = false) {
     if (!content) return;
+    // Team options must still follow server patches while a select or text field
+    // has focus. Update these controls in place without discarding the user's edit.
+    if(view==='settings')syncTeamControls();
     // Background work must not replace an input while the user is editing it.
     if (!force && (dragEgg || (content.contains(shadow.activeElement) && ['INPUT','SELECT'].includes(shadow.activeElement?.tagName)))) return;
     lastPaint=Date.now(); content.replaceChildren();
@@ -1197,14 +1200,37 @@
         catch(error){report(error.message);e.target.value=settings.feed.webhook.url;}
       }}));
   }
-  function renderSettings() {
-    let teams=[];try{teams=game.data().petTeams||[];}catch{}
-    const options=teams.map(t=>[String(t.id),t.name||String(t.id)]);
-    for (const [key,name] of [['hatch','부화 프리셋'],['sell','판매 프리셋'],['restore','종료 후 복구']]) {
-      const opts=key==='restore'?[['current','현재 프리셋'],...options]:[['','변경 안 함'],...options];
-      if(settings.teams[key]&&!opts.some(([id])=>id===settings.teams[key]))opts.push([settings.teams[key],'팀 목록 확인 대기']);
-      content.append(row(name,select(settings.teams[key],opts,v=>settings.teams[key]=v,name)));
+  function teamSnapshot() {
+    try{return nativeTeams(game.data());}catch{return null;}
+  }
+  function teamOptions(key,teams) {
+    const options=(teams || []).map(t=>[t.id,typeof t.name==='string' && t.name.trim()?t.name:t.id]);
+    const opts=key==='restore'?[['current','현재 프리셋'],...options]:[['','변경 안 함'],...options];
+    if(settings.teams[key]&&!opts.some(([id])=>id===settings.teams[key]))opts.push([settings.teams[key],teams===null?'팀 목록 확인 대기':'선택한 팀 확인 필요']);
+    return opts;
+  }
+  function syncTeamControls() {
+    const teams=teamSnapshot();
+    for(const node of content.querySelectorAll('select[data-preset]')) {
+      const key=node.dataset.preset,opts=teamOptions(key,teams),signature=JSON.stringify(opts);
+      if(node.dataset.options!==signature) {
+        node.replaceChildren(...opts.map(([value,text])=>el('option',{value,text})));
+        node.dataset.options=signature;node.value=settings.teams[key];
+      }
     }
+    const missing=teams!==null && Object.entries(settings.teams).some(([key,id])=>id && !(key==='restore' && id==='current') && !teams.some(t=>t.id===id));
+    const text=teams===null?'게임 펫 팀 동기화 대기':`게임 펫 팀 ${teams.length}개${missing?' · 찾을 수 없는 선택이 있습니다. 팀을 다시 선택하세요.':teams.length?' · 새 팀과 이름 변경 자동 반영':' · 게임에서 팀을 저장하면 표시됩니다.'}`;
+    const label=content.querySelector('.team-status');if(label)label.textContent=text;
+    return text;
+  }
+  function renderSettings() {
+    const teams=teamSnapshot();
+    for (const [key,name] of [['hatch','부화 프리셋'],['sell','판매 프리셋'],['restore','종료 후 복구']]) {
+      const opts=teamOptions(key,teams),node=select(settings.teams[key],opts,v=>{settings.teams[key]=v;syncTeamControls();},name);
+      node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
+    }
+    content.append(el('small',{class:'team-status'}),button('팀 목록 새로고침',()=>report(syncTeamControls())));
+    syncTeamControls();
     content.append(el('small',{text:'현재 프리셋은 실행 직전의 게임 펫 팀입니다. 복구도 게임 팀 변경 기능을 사용합니다.'}),el('h3',{text:'설정 백업'}));
     content.append(button('모든 설정 파일로 저장',exportSettings,'primary'),el('small',{text:'웹후크 주소, On/Off 상태와 아이콘 위치도 파일에 포함됩니다.'}));
     const input=el('input',{type:'file',accept:'.json,application/json',hidden:true,onchange:async e=>{
@@ -1231,7 +1257,7 @@
   }
   function importSettings(text) {
     if(running)throw Error('진행 중인 작업이 끝난 뒤 설정을 불러오세요.');
-    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;clearFeeding();validateTeamSettings();save();syncEggs();placeIcon();refresh(true);report('모든 설정을 불러왔습니다.');
+    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;clearFeeding();save();syncEggs();placeIcon();refresh(true);report('모든 설정을 불러왔습니다.');
     if(!settings.autoBuy)pendingBuy.clear();
     if(settings.autoBuy&&!wasBuy){void loadCatalog();void loadLive();scheduleBuy();}
     if(settings.autoFeed)void loadCatalog().then(observeFeed);
