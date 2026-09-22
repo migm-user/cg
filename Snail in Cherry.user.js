@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.5
+// @version      1.4.6
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -28,7 +28,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.5', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.6', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -85,6 +85,7 @@
     eggs: { order: [], enabled: {}, direction: '좌' },
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
     teams: { hatch: '', sell: '', restore: 'current' },
+    registeredTeams: [], manualTeamsOpen: false,
     webhook: { enabled: false, url: '' }, position: null, panelPosition: null, collapsedShops: []
   });
   function settingsFrom(raw) {
@@ -96,7 +97,7 @@
         dst[key] = src[key];
       }
     };
-    for (const key of ['autoBuy', 'autoStore', 'autoFeed']) bool(raw, key, s);
+    for (const key of ['autoBuy', 'autoStore', 'autoFeed','manualTeamsOpen']) bool(raw, key, s);
     for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed']) {
       if (own(raw, section) && (!raw[section] || typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw Error(`${section}: 형식 오류`);
     }
@@ -148,6 +149,17 @@
     for (const key of ['hatch','sell','restore']) if (own(raw.teams, key)) {
       if (typeof raw.teams[key] !== 'string' || raw.teams[key].length > 160) throw Error('팀 설정 형식 오류');
       s.teams[key] = raw.teams[key];
+    }
+    if(own(raw,'registeredTeams')) {
+      const validId=v=>typeof v==='string' && /^[\w:.-]{1,160}$/.test(v);
+      if(!Array.isArray(raw.registeredTeams) || raw.registeredTeams.length>60)throw Error('직접 등록한 프리셋 형식 오류');
+      const seen=new Set();
+      for(const t of raw.registeredTeams) {
+        if(!t || !validId(t.id) || !validId(t.accountId) || typeof t.name!=='string' || !t.name.trim() || t.name.length>80 ||
+          !Array.isArray(t.members) || t.members.length<1 || t.members.length>3 || t.members.some(m=>!validId(m?.petId)) || new Set(t.members.map(m=>m.petId)).size!==t.members.length)throw Error('직접 등록한 프리셋 값 오류');
+        const key=t.accountId+':'+t.id;if(seen.has(key))throw Error('중복된 직접 등록 프리셋');seen.add(key);
+        s.registeredTeams.push({id:t.id,accountId:t.accountId,name:t.name.trim(),members:t.members.map(m=>({petId:m.petId}))});
+      }
     }
     if (raw.webhook) {
       bool(raw.webhook, 'enabled', s.webhook);
@@ -277,6 +289,13 @@
   const members = team => (Array.isArray(team?.members) ? team.members : []).map(m => String(m?.petId || '')).filter(Boolean).sort();
   // Native v1240 teams are part of the current player's authoritative data.
   const nativeTeams = data => Array.isArray(data?.petTeams) ? data.petTeams.filter(t=>t && typeof t.id==='string' && t.id.trim()) : null;
+  function accountKey(root,selfId) {
+    const player=root?.data?.players?.find(p=>String(p?.id)===String(selfId)),slot=mySlot(root,selfId);
+    for(const key of ['databaseUserId','discordUserId','userId'])for(const obj of [player,player?.data,slot,slot?.data]) {
+      const id=obj?.[key];if((typeof id==='string' && id || finite(id)) && !String(id).startsWith('p_'))return String(id);
+    }
+    return '';
+  }
   function requireTeam(data,id) {
     const team=nativeTeams(data)?.find(t=>t.id===id);
     if(!team)throw Error('선택한 펫 팀을 찾을 수 없습니다. 설정에서 팀 목록을 확인하세요.');
@@ -295,11 +314,14 @@
     read(selfId,roomState) {
       if(!this.get)return null;
       try {
-        const state=this.atom('stateAtom'),player=this.atom('playerAtom');if(!state)return null;
-        const root=this.get(state),me=player?this.get(player):null;
+        const read=label=>{try{const atom=this.atom(label);return atom?this.get(atom):null;}catch{return null;}};
+        const state=read('stateAtom'),root=state?.child?state:state?.state,me=read('playerAtom');
         if(me?.id && selfId && String(me.id)!==String(selfId))return null;
         if(root?.data?.roomSessionId && roomState?.data?.roomSessionId && root.data.roomSessionId!==roomState.data.roomSessionId)return null;
-        return nativeTeams(mySlot(root,me?.id || selfId)?.data);
+        // These are the game's authoritative own-player atoms, never prediction atoms.
+        // They remain usable when stateAtom is absent or exposes a publication wrapper.
+        const sources=[nativeTeams(read('myDataAtom')),nativeTeams(read('myUserSlotAtom')?.data),nativeTeams(mySlot(root,me?.id || selfId)?.data)];
+        return sources.find(teams=>teams?.length) ?? sources.find(teams=>teams!==null) ?? null;
       }catch{return null;}
     }
     async connect() {
@@ -308,7 +330,7 @@
       this.pending=this.capture().finally(()=>{this.pending=null;});return this.pending;
     }
     async capture() {
-      const cache=this.page.jotaiAtomCache?.cache;if(!cache?.values || !this.atom('stateAtom'))return false;
+      const cache=this.page.jotaiAtomCache?.cache;if(!cache?.values || !['stateAtom','myDataAtom','myUserSlotAtom'].some(label=>this.atom(label)))return false;
       // Same native stateAtom/playerAtom path used by Arie's server-team watcher.
       // Discover a real game store, without reading Arie's globals or saved settings.
       const hook=this.page.__REACT_DEVTOOLS_GLOBAL_HOOK__;
@@ -319,7 +341,7 @@
           for(const store of [fiber.pendingProps?.value,fiber.memoizedProps?.value])if(typeof store?.get==='function' && typeof store.sub==='function') {
             this.get=atom=>store.get(atom);
             const changed=()=>{const teams=this.read();const signature=JSON.stringify(teams);if(signature!==this.lastTeams){this.lastTeams=signature;this.changed();}};
-            for(const atom of [this.atom('stateAtom'),this.atom('playerAtom')].filter(Boolean))this.unsub.push(store.sub(atom,changed));
+            for(const atom of ['stateAtom','playerAtom','myDataAtom','myUserSlotAtom'].map(label=>this.atom(label)).filter(Boolean))this.unsub.push(store.sub(atom,changed));
             return true;
           }
           stack.push(fiber.child,fiber.sibling,fiber.alternate);
@@ -404,6 +426,7 @@
       this.selfId = ''; this.generation = 0; this.revision = 0; this.pending = new Map(); this.sessions = new WeakMap();
       this.shopWatch = new Map();
       this.serverClock=null;
+      this.nativeTeamAttempt=null;this.lastNativeTeam=null;
     }
     install() {
       const link = this, Native = this.page.WebSocket, original = Native.prototype.send;
@@ -420,7 +443,14 @@
                 session.sent.set(msg.requestId,seq);
                 if (session.sent.size > 512) session.sent.delete(session.sent.keys().next().value);
               }
-              payload = JSON.stringify({ ...msg, commandSequence: seq });
+              msg.commandSequence=seq;payload = JSON.stringify(msg);
+            }
+            const command=msg.type==='QuinoaCommand'?msg.command:msg;
+            if(command?.type==='ApplyPetTeam' && typeof command.teamId==='string' && command.teamId && !link.pending.has(msg.requestId)) {
+              const data=link.data(),known=nativeTeams(data)?.find(t=>t.id===command.teamId);
+              link.nativeTeamAttempt={id:command.teamId,requestId:msg.requestId,sequence:msg.commandSequence,at:Date.now(),ack:false,watermark:false,touched:false,before:activeIds(data),expected:known?members(known):null};
+              link.lastNativeTeam=null;
+              link.changed(undefined,{type:'native-team-request'});
             }
           } catch { /* Non-JSON messages are owned by the game. */ }
         }
@@ -457,6 +487,7 @@
     }
     invalidate(reason) {
       this.root = null; this.generation++;this.serverClock=null;
+      this.nativeTeamAttempt=null;this.lastNativeTeam=null;
       for (const p of this.pending.values()) p.error = Error(reason);
       this.changed(reason);
     }
@@ -472,6 +503,10 @@
       if (socket !== this.socket) return;
       if(finite(msg.publishedAtServerMs))this.serverClock={at:msg.publishedAtServerMs,received:Date.now()};
       if (msg.type === 'QuinoaCommandResult') {
+        if(this.nativeTeamAttempt?.requestId===msg.requestId && msg.requestId) {
+          if(msg.ok===true)this.nativeTeamAttempt.ack=true;
+          else {this.nativeTeamAttempt=null;this.changed('게임에서 펫 팀 적용을 거절했습니다.',{type:'native-team-rejected'});}
+        }
         const pending = this.pending.get(msg.requestId);
         if (pending) {
           if (msg.ok === true) pending.ack = true;
@@ -485,6 +520,12 @@
       const patches = msg.type === 'RoomFrame' ? msg.state?.patches : msg.type === 'PartialState' ? msg.patches : null;
       if (this.root && Array.isArray(patches)) {
         this.root = applyPatches(this.root,patches); this.revision++;
+        const attempt=this.nativeTeamAttempt;
+        if(attempt) {
+          const index=this.root.child?.data?.userSlots?.indexOf(mySlot(this.root,this.selfId));
+          const prefix=`/child/data/userSlots/${index}`;
+          if(index>=0)attempt.touched ||= patches.some(p=>p.path==='' || p.path==='/child' || p.path==='/child/data' || p.path==='/child/data/userSlots' || p.path===prefix || p.path===prefix+'/data' || p.path===prefix+'/data/petSlots' || p.path.startsWith(prefix+'/data/petSlots/'));
+        }
         const identityChanged=patches.some(p=>/^\/data(?:\/players(?:\/|$)|$)/.test(p.path) || /^\/child\/data\/userSlots\/\d+(?:\/data)?\/(id|userId|playerId|discordUserId|databaseUserId)(?:\/|$)/.test(p.path));
         const relevant=identityChanged || patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/shops(?:\/|$)/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/(inventory|garden|petTeams|petSlots|coinsCount|shopPurchases)(?:\/|$)/.test(p.path));
         if(relevant) {
@@ -493,6 +534,18 @@
           const uiChanged=patches.some(p=>!p.path.endsWith('/secondsUntilRestock'));
           const feedChanged=patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/(inventory|petSlots)(?:\/|$)/.test(p.path));
           this.changed(undefined,{type:'state',uiChanged,feedChanged,...events});
+        }
+      }
+      const attempt=this.nativeTeamAttempt;
+      if(attempt && Date.now()-attempt.at>10000){this.nativeTeamAttempt=null;this.changed(undefined,{type:'native-team-expired'});return;}
+      if(attempt && finite(attempt.sequence) && finite(msg.executedCommandSequence) && msg.executedCommandSequence>=attempt.sequence)attempt.watermark=true;
+      if(attempt?.touched) {
+        const ids=activeIds(mySlot(this.root,this.selfId)?.data),accountId=accountKey(this.root,this.selfId);
+        if(attempt.expected && !sameIds(ids,attempt.expected))return;
+        if(!(attempt.ack || attempt.watermark || !sameIds(ids,attempt.before)))return;
+        if(accountId && ids.length>=1 && ids.length<=3 && new Set(ids).size===ids.length) {
+          this.lastNativeTeam={id:attempt.id,accountId,members:ids.map(petId=>({petId})),generation:this.generation};
+          this.nativeTeamAttempt=null;this.changed(undefined,{type:'native-team-confirmed'});
         }
       }
     }
@@ -558,7 +611,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -588,7 +641,7 @@
     }
     if(event?.restocked?.length) { scheduleBuy(event.restocked);void loadCatalog();void loadLive(); }
     if(event?.feedChanged)observeFeed();
-    if(event?.uiChanged || event?.restocked?.length)schedulePaint();
+    if(event?.uiChanged || event?.restocked?.length || event?.type?.startsWith('native-team'))schedulePaint();
     if (footer && footer.textContent!==status) footer.textContent = status;
   });
   game.install();
@@ -1269,17 +1322,22 @@
       }}));
   }
   function teamSnapshot() {
-    if(!game.root || game.socket?.readyState!==1)return null;
+    if(game.socket && game.socket.readyState!==1)return null;
     const native=nativeGameTeams.read(game.selfId,game.root);
-    if(native!==null)return native;
-    return nativeTeams(mySlot(game.root,game.selfId)?.data);
+    const wire=nativeTeams(mySlot(game.root,game.selfId)?.data),accountId=accountKey(game.root,game.selfId);
+    const registered=settings.registeredTeams.filter(t=>accountId && t.accountId===accountId).map(t=>({...t,manual:true}));
+    if(native===null && wire===null && !registered.length)return null;
+    // An empty/unavailable reader must not hide another source's confirmed teams.
+    const merged=new Map(registered.map(t=>[t.id,t]));
+    for(const t of [...(wire || []),...(native || [])])merged.set(t.id,t);
+    return [...merged.values()];
   }
   async function refreshNativeTeams() {
     await nativeGameTeams.connect();
     if(view==='settings')report(syncTeamControls());
   }
   function teamOptions(key,teams) {
-    const options=(teams || []).map(t=>[t.id,typeof t.name==='string' && t.name.trim()?t.name:t.id]);
+    const options=(teams || []).map(t=>[t.id,`${t.manual?'직접 등록 · ':''}${typeof t.name==='string' && t.name.trim()?t.name:t.id}`]);
     const opts=key==='restore'?[['current','현재 프리셋'],...options]:[['','변경 안 함'],...options];
     if(settings.teams[key]&&!opts.some(([id])=>id===settings.teams[key]))opts.push([settings.teams[key],teams===null?'팀 목록 확인 대기':'선택한 팀 확인 필요']);
     return opts;
@@ -1294,9 +1352,57 @@
       }
     }
     const missing=teams!==null && Object.entries(settings.teams).some(([key,id])=>id && !(key==='restore' && id==='current') && !teams.some(t=>t.id===id));
-    const text=teams===null?'게임 펫 팀 동기화 대기':`게임 펫 팀 ${teams.length}개${missing?' · 찾을 수 없는 선택이 있습니다. 팀을 다시 선택하세요.':teams.length?' · 새 팀과 이름 변경 자동 반영':' · 게임에서 팀을 저장하면 표시됩니다.'}`;
+    const manualCount=teams?.filter(t=>t.manual).length || 0,nativeCount=(teams?.length || 0)-manualCount;
+    const text=teams===null?'게임 펫 팀 동기화 대기':`게임 펫 팀 ${nativeCount}개${manualCount?` · 직접 등록 ${manualCount}개`:''}${missing?' · 찾을 수 없는 선택이 있습니다. 팀을 다시 선택하세요.':nativeCount?' · 새 팀과 이름 변경 자동 반영':manualCount?' · 등록한 프리셋 사용 가능':' · 목록이 비어 있으면 아래에서 직접 등록하세요.'}`;
     const label=content.querySelector('.team-status');if(label)label.textContent=text;
+    const current=content.querySelector('.manual-team-current');
+    if(current)current.textContent=`감지된 현재 프리셋: ${currentTeam()?.id || '게임에서 사용할 펫 팀을 한 번 적용하세요.'}`;
     return text;
+  }
+  function currentTeam() {
+    if(game.nativeTeamAttempt && Date.now()-game.nativeTeamAttempt.at<=10000)return null;
+    let data;try{data=game.data();}catch{return null;}
+    const ids=activeIds(data),accountId=accountKey(game.root,game.selfId);
+    if(!ids.length)return null;
+    const observed=game.lastNativeTeam;
+    if(observed && observed.generation===game.generation && observed.accountId===accountId && sameIds(members(observed),ids))return observed;
+    return teamSnapshot()?.find(t=>sameIds(members(t),ids)) || null;
+  }
+  function registerCurrentTeam(key,explicitId='') {
+    if(running)throw Error('진행 중인 작업이 끝난 뒤 프리셋을 등록하세요.');
+    if(game.nativeTeamAttempt && Date.now()-game.nativeTeamAttempt.at<=10000)throw Error('게임 펫 팀 변경 확인 중 · 적용이 끝난 뒤 등록하세요.');
+    const data=game.data(),accountId=accountKey(game.root,game.selfId),ids=activeIds(data);
+    const detected=currentTeam(),id=explicitId.trim() || detected?.id;
+    if(!id)throw Error('게임에서 원하는 펫 팀을 한 번 적용한 뒤 현재 프리셋을 누르세요.');
+    if(!/^[\w:.-]{1,160}$/.test(id))throw Error('프리셋 ID 형식을 확인하세요.');
+    if(!accountId)throw Error('내 계정 정보 확인 대기 · 프리셋 등록 보류');
+    if(ids.length<1 || ids.length>3 || new Set(ids).size!==ids.length)throw Error('사용 중인 펫 1~3마리를 확인한 뒤 등록하세요.');
+    const names={hatch:'부화',sell:'판매',restore:'복구'};
+    const previous=settings.registeredTeams.find(t=>t.id===id && t.accountId===accountId);
+    if(!previous && settings.registeredTeams.length>=60)throw Error('직접 등록 프리셋은 최대 60개입니다.');
+    const record={id,accountId,name:previous?.name || (detected?.id===id && detected.name) || `${names[key]} 프리셋`,members:ids.map(petId=>({petId}))};
+    settings.registeredTeams=settings.registeredTeams.filter(t=>!(t.id===id && t.accountId===accountId));
+    settings.registeredTeams.push(record);settings.teams[key]=id;save();refresh(true);
+    report(`${names[key]} 현재 프리셋 등록 완료 · 펫 ${ids.length}마리`);
+  }
+  function renderManualTeams() {
+    const details=el('details',{class:'shop-category manual-teams',open:settings.manualTeamsOpen});
+    details.append(el('summary',{text:'현재 프리셋 직접 등록'}));
+    details.addEventListener('toggle',()=>{if(details.isConnected){settings.manualTeamsOpen=details.open;save();placePanel();}});
+    const body=el('div',{class:'category-body'});
+    body.append(el('small',{text:'게임에서 원하는 펫 팀을 한 번 적용한 뒤, 해당 용도의 현재 프리셋 버튼을 누르세요. 팀 목록 없이도 등록할 수 있습니다.'}));
+    for(const [key,label] of [['hatch','부화'],['sell','판매'],['restore','복구']]) {
+      const input=el('input',{type:'text',ariaLabel:`${label} 프리셋 ID 직접 입력`,placeholder:'현재 팀 ID 또는 직접 입력',value:settings.teams[key]==='current'?'':settings.teams[key],maxLength:160});
+      const apply=button('현재 프리셋',()=>{try{registerCurrentTeam(key);}catch(error){report(error.message);}});
+      apply.setAttribute('aria-label',`${label} 현재 프리셋 등록`);
+      input.addEventListener('change',()=>{
+        try{if(input.value.trim())registerCurrentTeam(key,input.value);else{settings.teams[key]=key==='restore'?'current':'';save();syncTeamControls();}}
+        catch(error){report(error.message);input.value=settings.teams[key]==='current'?'':settings.teams[key];}
+      });
+      body.append(el('div',{class:'row'},el('span',{text:label}),el('div',{class:'manual-team-input'},input,apply)));
+    }
+    body.append(el('small',{class:'manual-team-current'}),el('small',{text:'직접 입력할 ID는 현재 착용 중인 게임 팀의 ID여야 합니다. 등록 내용은 설정 파일에 함께 저장됩니다.'}));
+    details.append(body);return details;
   }
   function renderSettings() {
     const teams=teamSnapshot();
@@ -1305,6 +1411,7 @@
       node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
     }
     content.append(el('small',{class:'team-status'}),button('팀 목록 새로고침',()=>void refreshNativeTeams()));
+    content.append(renderManualTeams());
     syncTeamControls();
     content.append(el('small',{text:'현재 프리셋은 실행 직전의 게임 펫 팀입니다. 복구도 게임 팀 변경 기능을 사용합니다.'}),el('h3',{text:'설정 백업'}));
     content.append(button('모든 설정 파일로 저장',exportSettings,'primary'),el('small',{text:'웹후크 주소, On/Off 상태와 아이콘 위치도 파일에 포함됩니다.'}));
@@ -1395,6 +1502,7 @@
       header{padding:9px 10px 0;flex:none;cursor:move;touch-action:none;user-select:none}.brand{display:flex;align-items:center;justify-content:space-between;gap:8px}.brand strong{font-size:13px;font-weight:650;flex:1;padding:5px 0;letter-spacing:-.2px}.brand button{font-size:17px;line-height:1;width:25px;height:25px;padding:0;color:#c7cccd;cursor:pointer}.badges{display:flex;align-items:center;gap:7px;margin:6px 0 8px}.badges span{font-size:11px;border:1px solid #4b8562;background:#32544044;border-radius:5px;padding:2px 6px;color:#e0eee5}.subhead{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid #ffffff16;cursor:default}.page-name{flex:1;font-size:12px;color:#aeb8b4}.home .subhead{padding:0;border-top:0}.home .page-name{display:none}.back{font-size:11px;padding:4px 8px}.stop{font-size:11px;color:#f0c8c2;border-color:#8c635f;margin:5px 0}
       .body{padding:0 10px 9px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#ffffff28 transparent;min-height:0}.home .body{padding:4px 10px 8px;border-top:1px solid #ffffff16}.menu-row{display:flex;align-items:center;min-height:34px;gap:8px}.menu-link{flex:1;text-align:left;background:none;border:0;font-weight:500;padding:6px 0;border-radius:4px}.menu-link:hover{background:#ffffff06}.pill{font-size:12px;min-width:43px;padding:4px 7px;border:1px solid #ffffff25;background:#ffffff06}
       .row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #ffffff0d}.grow{flex:1;min-width:0}.label{font-weight:500;overflow-wrap:anywhere}small{display:block;font-size:11px;color:#97a39f;line-height:1.4;margin-top:2px}p{font-size:12px;color:#b1bab7;margin:7px 0 9px}h3{font-size:12px;color:#b7c9bf;margin:12px 0 4px;font-weight:600}h2{font-size:17px;margin-top:0}
+      .manual-team-input{display:flex;gap:4px;flex:1;min-width:0}.manual-team-input input{width:0;flex:1}.manual-team-input button{flex:none;font-size:10px;padding:4px 5px}.manual-team-current{overflow-wrap:anywhere;padding:5px 0}.manual-teams .category-body>small{padding-top:5px}
       .rooms{display:flex;gap:6px;padding-top:8px;margin-top:5px;border-top:1px solid #ffffff16}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
       .feed-pet{border-top:1px solid #ffffff14}.feed-pet>summary{padding:7px 0;background:none}.feed-pet>summary .item{min-width:0}.feed-pet>.row{padding:5px 0 5px 10px}.feed-pet>.row small:empty{display:none}
       .switch{display:inline-flex;flex:none;position:relative;width:35px;height:21px;cursor:pointer}.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.switch span{width:35px;height:21px;border-radius:12px;background:#ffffff24;pointer-events:none}.switch span:after{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#d7dedb;margin:3px;transition:transform .15s}.switch input:checked+span{background:#498060}.switch input:checked+span:after{transform:translateX(14px);background:#f1fff6}.switch input:focus-visible+span{outline:2px solid #6caf84;outline-offset:3px}
