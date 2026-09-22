@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.1
+// @version      1.4.2
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -27,7 +27,7 @@
  * or creates a second game connection. CommonJS exports are for offline tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.1', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.2', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -1154,8 +1154,7 @@
       return details;
     }
     for(const group of groups) {
-      const price=meta('Egg',group.id).coinPrice;
-      const egg=folded('openEggs',group.id,el('span',{text:group.id==='Other'?'기타 동물':`${title('Egg',group.id)}${finite(price)?` · ${price.toLocaleString()} 코인`:''}` }),'shop-category feed-egg');
+      const egg=folded('openEggs',group.id,el('span',{text:group.id==='Other'?'기타 동물':title('Egg',group.id)}),'shop-category feed-egg');
       egg.dataset.egg=group.id;
       const body=el('div',{class:'category-body'});egg.append(body);
       for(const {species,probability} of group.pets) {
