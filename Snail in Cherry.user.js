@@ -2,8 +2,8 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.3.0
-// @description  독립 상점 구매·알 심기·부화·펫 판매와 설정 백업
+// @version      1.4.1
+// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -27,7 +27,7 @@
  * or creates a second game connection. CommonJS exports are for offline tests. */
 (function () {
   'use strict';
-  const VERSION = '1.3.0', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.1', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -79,7 +79,8 @@
     return {storage,storageId,held,amount:Math.min(amount,quantity(entry)),itemKey:item.itemType==='Tool' ? entry.id || itemId(entry) : itemId(entry)};
   }
   const defaults = () => ({
-    autoBuy: false, autoStore: false, buy: {},
+    autoBuy: false, autoStore: false, autoFeed: false, buy: {},
+    feed: { allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
     teams: { hatch: '', sell: '', restore: 'current' },
@@ -94,8 +95,8 @@
         dst[key] = src[key];
       }
     };
-    for (const key of ['autoBuy', 'autoStore']) bool(raw, key, s);
-    for (const section of ['eggs', 'protect', 'teams', 'webhook']) {
+    for (const key of ['autoBuy', 'autoStore', 'autoFeed']) bool(raw, key, s);
+    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed']) {
       if (own(raw, section) && (!raw[section] || typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw Error(`${section}: 형식 오류`);
     }
     const dict = source => {
@@ -108,6 +109,22 @@
       return result;
     };
     if (own(raw, 'buy')) s.buy = dict(raw.buy);
+    if(raw.feed) {
+      if(own(raw.feed,'allowed'))s.feed.allowed=dict(raw.feed.allowed);
+      for(const key of ['openEggs','openPets'])if(own(raw.feed,key)) {
+        if(!Array.isArray(raw.feed[key]) || raw.feed[key].length>1000 || raw.feed[key].some(v=>typeof v!=='string'||!/^[\w:.-]{1,160}$/.test(v)))throw Error('펫 먹이 접기 설정 오류');
+        s.feed[key]=[...new Set(raw.feed[key])];
+      }
+      if(own(raw.feed,'webhook')) {
+        const hook=raw.feed.webhook;
+        if(!hook || typeof hook!=='object' || Array.isArray(hook))throw Error('펫 먹이 웹후크 설정 오류');
+        bool(hook,'enabled',s.feed.webhook);
+        if(own(hook,'url')) {
+          if(typeof hook.url!=='string'||hook.url.length>2048)throw Error('펫 먹이 웹후크 주소 오류');
+          s.feed.webhook.url=hook.url.trim();if(s.feed.webhook.url)webhookURL(s.feed.webhook.url);
+        }
+      }
+    }
     if (raw.eggs) {
       if (own(raw.eggs, 'order')) {
         if (!Array.isArray(raw.eggs.order) || raw.eggs.order.length > 1000 || raw.eggs.order.some(id => typeof id !== 'string' || !/^[\w.-]{1,120}$/.test(id) || ['__proto__','constructor','prototype'].includes(id))) throw Error('알 순서 형식 오류');
@@ -254,12 +271,63 @@
   const members = team => (Array.isArray(team?.members) ? team.members : []).map(m => String(m?.petId || '')).filter(Boolean).sort();
   const activeIds = data => (Array.isArray(data?.petSlots) ? data.petSlots : []).map(p => String(p?.id || '')).filter(Boolean).sort();
   const sameIds = (a,b) => a.length === b.length && a.every((v,i) => v === b[i]);
+  const FEED_THRESHOLD=5;
+  function hungerPercent(pet,catalog) {
+    const max=catalog.pets?.[pet?.petSpecies]?.coinsToFullyReplenishHunger;
+    return finite(max) && max>0 && finite(pet?.hunger) && pet.hunger>=0 ? Math.min(100,pet.hunger/max*100) : null;
+  }
+  const hungryStage = (pet,catalog) => {
+    const percent=hungerPercent(pet,catalog);
+    return percent===null || percent>=FEED_THRESHOLD ? '' : percent===0 ? 'empty' : 'low';
+  };
+  function petFoodGroups(catalog) {
+    const seen=new Set();
+    const groups=Object.entries(catalog.eggs || {}).sort(([a,x],[b,y])=>
+      (finite(x.coinPrice)?x.coinPrice:Infinity)-(finite(y.coinPrice)?y.coinPrice:Infinity) || a.localeCompare(b)).map(([id,egg])=> {
+      const weights=Object.entries(egg.faunaSpawnWeights || {}).filter(([,v])=>finite(v)&&v>0);
+      const total=weights.reduce((n,[,w])=>n+w,0);
+      const pets=weights.filter(([species])=>catalog.pets?.[species]).sort(([a,x],[b,y])=>y-x || a.localeCompare(b)).map(([species,weight])=> {
+        seen.add(species);return {species,probability:weight/total*100};
+      });
+      return {id,pets};
+    }).filter(g=>g.pets.length);
+    const other=Object.keys(catalog.pets || {}).filter(s=>!seen.has(s)).sort().map(species=>({species,probability:null}));
+    if(other.length)groups.push({id:'Other',pets:other});
+    return groups;
+  }
+  const foodKey = (species,type,id) => `${species}:${type}:${id}`;
+  const foodAllowed = (settings,species,type,id) => settings.feed.allowed[foodKey(species,type,id)]!==false;
+  function chooseFood(data,pet,catalog,settings) {
+    const diet=catalog.pets?.[pet.petSpecies]?.diet;
+    if(!Array.isArray(diet))return null;
+    const produce=i=>i?.itemType==='Produce' && i.id && diet.includes(i.species) && quantity(i)>0 && foodAllowed(settings,pet.petSpecies,'Produce',i.species);
+    const potion=i=>i?.itemType==='Tool' && i.toolId==='ReplenishPotion' && quantity(i)>0 && foodAllowed(settings,pet.petSpecies,'Tool','ReplenishPotion');
+    const items=data.inventory?.items || [],storages=data.inventory?.storages || [];
+    // Locks deliberately do not filter food: the user explicitly enables feeding locked items.
+    for(const [test,storageId] of [[produce,'FeedingTrough'],[potion,'ToolShack']]) {
+      const item=items.find(test);if(item)return {item};
+      const storage=storages.find(s=>(s.decorId || s.id)===storageId);
+      const stored=storageItems(storage).find(test);if(stored)return {item:stored,storageId};
+    }
+    return null;
+  }
+  function petPosition(data,id,serverNow=null) {
+    const info=data.petSlotInfos?.[id],motion=info?.motion;
+    let p=motion ? ((!motion.kind || motion.kind==='idle') ? motion.at : null) : info?.position;
+    if(!p && Array.isArray(motion?.path) && motion.path.length && finite(serverNow) && finite(motion.startedAtMs) && finite(motion.stepDurationMs) && motion.stepDurationMs>=0 &&
+      serverNow>=motion.startedAtMs+motion.stepDurationMs*(motion.path.length-1))p=motion.path.at(-1);
+    return finite(p?.x)&&finite(p?.y)?{x:p.x,y:p.y}:null;
+  }
+  const samePoint=(a,b)=>a && b && a.x===b.x && a.y===b.y;
+  const foodLocked=(inventory,item)=>!!item && (item.locked===true || item.isLocked===true || item.favorited===true ||
+    (typeof item.id==='string' && inventory.favoritedItemIds?.includes(item.id)));
 
   class GameLink {
     constructor(page, changed = () => {}) {
       this.page = page; this.changed = changed; this.root = null; this.socket = null;
       this.selfId = ''; this.generation = 0; this.revision = 0; this.pending = new Map(); this.sessions = new WeakMap();
       this.shopWatch = new Map();
+      this.serverClock=null;
     }
     install() {
       const link = this, Native = this.page.WebSocket, original = Native.prototype.send;
@@ -312,19 +380,21 @@
       return session;
     }
     invalidate(reason) {
-      this.root = null; this.generation++;
+      this.root = null; this.generation++;this.serverClock=null;
       for (const p of this.pending.values()) p.error = Error(reason);
       this.changed(reason);
     }
     receive(socket,msg) {
       if (msg.type === 'Welcome' && msg.fullState?.child?.data?.userSlots && typeof msg.selfPlayerId === 'string') {
         this.invalidate('게임 연결 확인'); this.socket = socket; this.root = msg.fullState; this.selfId = msg.selfPlayerId;
+        if(finite(msg.publishedAtServerMs))this.serverClock={at:msg.publishedAtServerMs,received:Date.now()};
         this.revision++;
         this.shopWatch.clear(); this.observeShops();
         const session = this.sessions.get(socket); session.next = Math.max(1,Number(msg.executedCommandSequence || 0)+1); session.sent.clear();
         this.changed('게임 연결됨',{type:'ready'}); return;
       }
       if (socket !== this.socket) return;
+      if(finite(msg.publishedAtServerMs))this.serverClock={at:msg.publishedAtServerMs,received:Date.now()};
       if (msg.type === 'QuinoaCommandResult') {
         const pending = this.pending.get(msg.requestId);
         if (pending) {
@@ -344,7 +414,8 @@
           const shopsChanged=patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/shops(?:\/|$)/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /\/shopPurchases(?:\/|$)/.test(p.path));
           const events=shopsChanged?this.observeShops():{restocked:[],eggPurchases:[]};
           const uiChanged=patches.some(p=>!p.path.endsWith('/secondsUntilRestock'));
-          this.changed(undefined,{type:'state',uiChanged,...events});
+          const feedChanged=patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/(inventory|petSlots)(?:\/|$)/.test(p.path));
+          this.changed(undefined,{type:'state',uiChanged,feedChanged,...events});
         }
       }
     }
@@ -378,18 +449,19 @@
       const watch = this.shopWatch.get(shop);
       return {...stock(this.root,this.data(),shop,id,watch?.stale),cycle:watch?.cycle || 0};
     }
+    serverNow() { return this.serverClock ? this.serverClock.at+Date.now()-this.serverClock.received : null; }
     data() {
       if (!this.root || this.socket?.readyState !== 1) throw Error('게임 연결 대기 · 설치 후 게임 페이지를 새로고침하세요.');
       const data = mySlot(this.root,this.selfId)?.data;
       if (!data?.inventory || !Array.isArray(data.inventory.items)) throw Error('내 인벤토리 동기화 대기');
       return data;
     }
-    async command(type,params,predicate,timeout = 12000,{stateConfirms = false} = {}) {
+    async command(type,params,predicate,timeout = 12000,{stateConfirms = false,flat = false} = {}) {
       this.data();
       const generation = this.generation, revision = this.revision, requestId = this.page.crypto.randomUUID();
       const pending = { ack: false, error: null }; this.pending.set(requestId,pending);
       try {
-        this.socket.send(JSON.stringify({ scopePath: ['Room','Quinoa'], type: 'QuinoaCommand', requestId,
+        this.socket.send(JSON.stringify(flat ? {scopePath:['Room','Quinoa'],type,...params} : { scopePath: ['Room','Quinoa'], type: 'QuinoaCommand', requestId,
           commandSequence: this.sessions.get(this.socket).next, command: { type,...params } }));
         const deadline = Date.now()+timeout;
         while (Date.now() < deadline) {
@@ -409,7 +481,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan };
+  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,maxStrength,saleReason,readyEgg,stock,GameLink,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -420,6 +492,7 @@
   let liveInfo={},liveAt=0,livePromise=null,liveRetryAt=0;
   let panel, content, footer, icon, shadow, lastPaint = 0, paintTimer=null;
   const pendingBuy=new Set();let drainTimer=null,draining=false,readyGeneration=-1;
+  const pendingFeed=new Map(),feedStates=new Map();let feedTimer=null,lastFeedAt=0;
   let webhookQueue = Promise.resolve(), importNeedsTeams = false;
   const log = [];
   const save = () => GM_setValue(KEY,settings);
@@ -430,14 +503,15 @@
   }
   const game = new GameLink(page,(message,event) => {
     if (message) report(message);
-    if(!game.root) { pendingBuy.clear();readyGeneration=-1;return; }
+    if(!game.root) { pendingBuy.clear();clearFeeding();readyGeneration=-1;return; }
     let data;try{data=game.data();}catch{return;}
     if(readyGeneration!==game.generation) {
       readyGeneration=game.generation;validateTeamSettings();syncEggs();
-      void loadCatalog();void loadLive();scheduleBuy();schedulePaint();return;
+      void loadCatalog().then(observeFeed);void loadLive();scheduleBuy();schedulePaint();return;
     }
     if(importNeedsTeams)validateTeamSettings();
     if(event?.restocked?.length) { scheduleBuy(event.restocked);void loadCatalog();void loadLive(); }
+    if(event?.feedChanged)observeFeed();
     if(event?.uiChanged || event?.restocked?.length)schedulePaint();
     if (footer && footer.textContent!==status) footer.textContent = status;
   });
@@ -469,7 +543,7 @@
       if (!data.eggs || !data.pets) throw Error('품목 API 형식 오류');
       catalog = data; catalogAt = Date.now();catalogRetryAt=0;
       catalogETag=String(response.responseHeaders||'').match(/^etag:\s*(.+)$/im)?.[1]?.trim()||'';
-      GM_setValue(CATALOG_KEY,{at:catalogAt,etag:catalogETag,data:catalog});syncEggs();schedulePaint();
+      GM_setValue(CATALOG_KEY,{at:catalogAt,etag:catalogETag,data:catalog});syncEggs();observeFeed();schedulePaint();
     } catch (error) { catalogRetryAt=Date.now()+60000;report(error.message); }
   }
   function loadLive() {
@@ -499,16 +573,61 @@
     if(!settings.autoBuy)return;
     for(const shop of shops)pendingBuy.add(shop);wakeAutomation();
   }
+  function clearFeeding() {
+    pendingFeed.clear();feedStates.clear();if(feedTimer!==null)clearTimeout(feedTimer);feedTimer=null;
+  }
+  function setAutoFeed(value) {
+    settings.autoFeed=value;clearFeeding();
+    report(`펫 먹이 ${value?'On · 배고픔 5% 미만에서 급식':'Off'}`);
+    if(value)void loadCatalog().then(observeFeed);
+  }
+  function observeFeed() {
+    if(!settings.autoFeed || !game.root || ['feed','hatch','sell'].includes(running?.kind))return;
+    let pets;try{pets=(game.data().petSlots || []).filter(Boolean).slice(0,3);}catch{return;}
+    const ids=new Set(pets.map(p=>p.id));
+    for(const id of pendingFeed.keys())if(!ids.has(id))pendingFeed.delete(id);
+    for(const pet of pets) {
+      if(!pet.id)continue;
+      const stage=hungryStage(pet,catalog);
+      if(!stage){feedStates.delete(pet.id);pendingFeed.delete(pet.id);continue;}
+      let state=feedStates.get(pet.id);
+      if(!state || state.stage!==stage) {
+        state={stage,complete:false,waiting:false};feedStates.set(pet.id,state);
+        report(`${pet.name || title('Pet',pet.petSpecies)} · 배고픔 알림 (${hungerPercent(pet,catalog).toFixed(1)}%)`);
+        notifyFeed(pet,'배고픔 알림',`배고픔 ${hungerPercent(pet,catalog).toFixed(1)}% · 1~5초 후 급식 대기`);
+      }
+      if(state.complete || pendingFeed.has(pet.id))continue;
+      if(state.waiting && !chooseFood(game.data(),pet,catalog,settings))continue;
+      state.waiting=false;
+      pendingFeed.set(pet.id,{id:pet.id,species:pet.petSpecies,hunger:pet.hunger,due:Date.now()+1000+Math.floor(Math.random()*4001)});
+    }
+    armFeedTimer();
+  }
+  function readyFeed() {
+    if(!settings.autoFeed || Date.now()<lastFeedAt+2000)return null;
+    return [...pendingFeed.values()].find(entry=>entry.due<=Date.now()) || null;
+  }
+  function armFeedTimer() {
+    if(feedTimer!==null)clearTimeout(feedTimer);feedTimer=null;
+    if(!settings.autoFeed || !pendingFeed.size || running || draining)return;
+    const due=Math.max(lastFeedAt+2000,Math.min(...[...pendingFeed.values()].map(e=>e.due)));
+    feedTimer=setTimeout(()=>{feedTimer=null;wakeAutomation();},Math.max(0,due-Date.now()));
+  }
   function wakeAutomation() {
-    if(drainTimer!==null || draining || running || !game.root || !pendingBuy.size)return;
+    if(drainTimer!==null || draining || running || !game.root)return;
+    if(!pendingBuy.size && !readyFeed()){armFeedTimer();return;}
     // Coalesce shop updates and multi-unit purchases arriving in one short burst.
-    drainTimer=setTimeout(()=>{drainTimer=null;void drainAutomation();},200);
+    drainTimer=setTimeout(()=>{drainTimer=null;void drainAutomation();},readyFeed()?0:200);
   }
   async function drainAutomation() {
     if(draining || running || !game.root)return;
     draining=true;
     try {
-      if(pendingBuy.size) {
+      const feed=readyFeed();
+      if(feed) {
+        pendingFeed.delete(feed.id);
+        await run('feed',job=>feedPet(job,feed));
+      }else if(pendingBuy.size) {
         const shops=new Set(pendingBuy);pendingBuy.clear();
         const generation=game.generation;
         if(settings.autoBuy) {await loadCatalog();if(settings.autoBuy && generation===game.generation)await run('buy',job=>buy(job,shops));}
@@ -516,7 +635,7 @@
     }finally{draining=false;wakeAutomation();}
   }
   function meta(type,id) {
-    return type === 'Seed' ? catalog.plants?.[id]?.seed || {} :
+    return type === 'Produce' ? catalog.plants?.[id]?.crop || {} : type === 'Seed' ? catalog.plants?.[id]?.seed || {} :
       catalog[{ Egg:'eggs',Tool:'items',Decor:'decor',Pet:'pets' }[type]]?.[id] || {};
   }
   function sprite(type,id) {
@@ -528,11 +647,21 @@
   const title = (type,id) => meta(type,id).name || id;
   function notifyPurchase(type,id,sent,confirmed,reason) {
     if (!settings.webhook.enabled || !settings.webhook.url) return;
-    const url = webhookURL(settings.webhook.url), image = sprite(type,id);
+    const image = sprite(type,id);
     const embed = { title: confirmed === sent && !reason ? '🛒 구매 완료' : '🛒 구매 결과',
       description: `${title(type,id)}\n구매 성공 재고 ${confirmed}/${sent}${reason ? `\n${reason}` : ''}`,
       color: reason ? 0xf0ad4e : 0xb34465, footer: { text: 'Snail in Cherry' }, timestamp: new Date().toISOString() };
     if (image) embed.thumbnail = { url: image };
+    sendWebhook(settings.webhook,embed);
+  }
+  function notifyFeed(pet,event,detail) {
+    const embed={title:`🍽️ ${event}`,description:`${pet.name || title('Pet',pet.petSpecies)}\n${detail}`,color:0x67987b,footer:{text:'Snail in Cherry'},timestamp:new Date().toISOString()};
+    const image=sprite('Pet',pet.petSpecies);if(image)embed.thumbnail={url:image};
+    sendWebhook(settings.feed.webhook,embed);
+  }
+  function sendWebhook(hook,embed) {
+    if(!hook.enabled || !hook.url)return;
+    const url=webhookURL(hook.url);
     const body = JSON.stringify({ username: 'Snail in Cherry', allowed_mentions: { parse: [] }, embeds: [embed] });
     webhookQueue = webhookQueue.then(async () => {
       for (let attempt=0; attempt<3; attempt++) {
@@ -542,7 +671,7 @@
           let seconds = 2; try { seconds = Number(JSON.parse(response.responseText).retry_after) || 2; } catch {}
           await sleep(Math.min(60000,Math.max(1000,seconds*1000))); continue;
         }
-        throw Error(`구매 결과 웹후크 전송 실패 (${response.status})`);
+        throw Error(`웹후크 전송 실패 (${response.status})`);
       }
     }).catch(error => report(error.message));
   }
@@ -571,7 +700,7 @@
   }
   function checkJob(job, restoring = false) {
     if (game.generation !== job.generation) throw Error('연결이 변경되어 작업을 중단했습니다.');
-    if (!restoring && (job.cancel || (job.kind === 'buy' && !settings.autoBuy))) throw Error('작업 중지');
+    if (!restoring && (job.cancel || (job.kind === 'buy' && !settings.autoBuy) || (job.kind==='feed' && !settings.autoFeed))) throw Error('작업 중지');
     game.data();
   }
   async function run(kind,action) {
@@ -582,7 +711,98 @@
     catch(error) {
       if (kind === 'buy') settings.autoBuy = false;
       save(); report(error.message);
-    } finally { running = null; refresh();wakeAutomation(); }
+    } finally { running = null; observeFeed();refresh();wakeAutomation(); }
+  }
+  async function feedPet(job,entry) {
+    const state=feedStates.get(entry.id);if(state)state.complete=true;
+    const current=()=>game.data().petSlots?.find(p=>p?.id===entry.id && p.petSpecies===entry.species);
+    let pet=current();
+    if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
+    const recipient={...pet};
+    const notice=(event,message)=>{report(`${recipient.name || title('Pet',recipient.petSpecies)} · ${message}`);notifyFeed(recipient,event,message);};
+    let selected=chooseFood(game.data(),pet,catalog,settings);
+    if(!selected) {
+      if(state){state.complete=false;state.waiting=true;}
+      notice('급식 대기','사용 가능한 먹이 없음 · 먹이 입고 시 다시 확인');return;
+    }
+    let unlockedId=null;
+    let food=selected.item;
+    try {
+      checkJob(job);
+      if(selected.storageId) {
+        const data=game.data();
+        if(data.inventory.items.filter(Boolean).length>=CAPACITY)throw Error('인벤토리 가득 참 · 먹이를 꺼낼 수 없습니다.');
+        const key=food.id || food.toolId,prior=quantity(food);
+        // Food UUIDs are retained by retrieval; potions may merge into an existing stack.
+        const owned=food.itemType==='Tool'?purchaseCapacity(data,food).held:quantity(data.inventory.items.find(i=>i?.id===food.id) || {quantity:0});
+        await game.command('RetrieveItemFromStorage',{itemId:key,storageId:selected.storageId,quantity:1},next=> {
+          const source=next.inventory.storages?.find(s=>(s.decorId || s.id)===selected.storageId);
+          const left=storageItems(source).find(i=>(i.id || i.toolId)===key);
+          const now=food.itemType==='Tool'?purchaseCapacity(next,food).held:quantity(next.inventory.items.find(i=>i?.id===food.id) || {quantity:0});
+          return now>owned && (!left || quantity(left)<prior);
+        },12000,{stateConfirms:true});
+        food=game.data().inventory.items.find(i=>food.itemType==='Tool'?i?.toolId===food.toolId:i?.id===food.id);
+        if(!food)throw Error('꺼낸 먹이 확인 실패');
+      }
+      checkJob(job);pet=current();
+      if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
+      if(!foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return;
+      if(foodLocked(game.data().inventory,food) && (typeof food.id!=='string' || !food.id))throw Error('먹이 개별 ID 확인 대기 · 잠금 유지');
+      if(food.itemType==='Tool') {
+        // Potion use needs the player on the pet's current tile. Teleport is a flat game message.
+        const deadline=Date.now()+8000;let position;
+        while(!(position=petPosition(game.data(),entry.id,game.serverNow())) && Date.now()<deadline){checkJob(job);await sleep(100);}
+        if(!position)throw Error('펫 위치 확인 대기 · 포션 미사용');
+        if(!samePoint(game.data().position,position))await game.command('Teleport',{position},next=>samePoint(next.position,position),8000,{flat:true,stateConfirms:true});
+        if(!samePoint(game.data().position,petPosition(game.data(),entry.id,game.serverNow())))throw Error('펫이 이동하여 포션 사용 보류');
+      }
+      checkJob(job);pet=current();
+      if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
+      if(!foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return;
+      // Only the selected item's own ID may be unlocked; species/tool IDs are never lock keys.
+      const inv=game.data().inventory;
+      if(!Array.isArray(inv.favoritedItemIds))throw Error('먹이 잠금 정보 확인 대기');
+      const candidate=inv.items.find(i=>food.id ? i?.id===food.id : i?.itemType==='Tool' && i.toolId===food.toolId);
+      if(!candidate || quantity(candidate)<=0)throw Error('선택한 먹이가 없어 급식 보류');
+      if(foodLocked(inv,candidate)) {
+        if(typeof candidate.id!=='string' || !candidate.id)throw Error('먹이 개별 ID 확인 대기 · 잠금 유지');
+        unlockedId=candidate.id;
+        await game.command('ToggleLockItem',{itemId:unlockedId},next=> {
+          const selected=next.inventory.items.find(i=>i?.id===unlockedId);
+          return !!selected && !foodLocked(next.inventory,selected);
+        },12000,{stateConfirms:true});
+      }
+      checkJob(job);pet=current();
+      if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
+      if(!foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return;
+      const dataBefore=game.data(),potion=food.itemType==='Tool';
+      const selectedNow=dataBefore.inventory.items.find(i=>potion?i?.itemType==='Tool' && i.toolId===food.toolId:i?.id===food.id);
+      if(!selectedNow || (food.id && selectedNow.id!==food.id) || quantity(selectedNow)<=0 || foodLocked(dataBefore.inventory,selectedNow))throw Error('먹이 수량·잠금·선택 변경 · 급식 보류');
+      const countSelected=next=>food.id ? quantity(next.inventory.items.find(i=>i?.id===food.id) || {quantity:0}) : purchaseCapacity(next,food).held;
+      const beforeHunger=pet.hunger,beforeCount=countSelected(dataBefore);
+      lastFeedAt=Date.now();
+      await game.command(potion?'ReplenishPotion':'FeedPet',potion?{petItemId:pet.id}:{petItemId:pet.id,cropItemId:food.id},next=> {
+        const after=next.petSlots?.find(p=>p?.id===pet.id);
+        const remaining=countSelected(next);
+        return finite(after?.hunger) && after.hunger>beforeHunger && remaining<beforeCount;
+      },12000,{stateConfirms:true});
+      notice('급식 완료',`${title(potion?'Tool':'Produce',potion?food.toolId:food.species)} 1개 지급 확인`);
+    }catch(error){
+      notice('급식 중단',error.message);
+    }finally{
+      if(unlockedId) {
+        try {
+          checkJob(job,true);
+          const inv=game.data().inventory;
+          const remaining=[...inv.items,...(inv.storages || []).flatMap(storageItems)].find(i=>i?.id===unlockedId);
+          if(remaining && !foodLocked(inv,remaining))
+            await game.command('ToggleLockItem',{itemId:unlockedId},next=> {
+              const same=[...next.inventory.items,...(next.inventory.storages || []).flatMap(storageItems)].find(i=>i?.id===unlockedId);
+              return !!same && foodLocked(next.inventory,same);
+            },12000,{stateConfirms:true});
+        }catch(error){notice('잠금 복구 확인 필요',error.message);}
+      }
+    }
   }
   async function buy(job,shops=new Set(['*'])) {
     let attempted = false, capped = false;
@@ -802,12 +1022,12 @@
     if (!force && (dragEgg || (content.contains(shadow.activeElement) && ['INPUT','SELECT'].includes(shadow.activeElement?.tagName)))) return;
     lastPaint=Date.now(); content.replaceChildren();
     panel.classList.toggle('home',view==='home');
-    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',settings:'설정' };
+    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',settings:'설정' };
     shadow.querySelector('.page-name').textContent=names[view];
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
-      for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['settings','설정','⚙️']]) {
-        const control=key==='buy' ? switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매') :
+      for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['feed','펫 먹이','🍽️'],['settings','설정','⚙️']]) {
+        const control=key==='feed'?switchFor(settings.autoFeed,setAutoFeed,'펫 먹이 자동 지급'):key==='buy' ? switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매') :
           button(key==='plant'?'심기':key==='hatch'?'부화':key==='sell'?'판매':'⚙️',() => key==='plant'?void run('plant',plant):key==='hatch'?hatchAll():key==='sell'?void sell():go('settings'),'pill');
         content.append(el('div',{ class:'menu-row' },button(`${glyph}  ${name}`,()=>go(key),'menu-link'),control));
       }
@@ -819,6 +1039,7 @@
       if (view==='plant') renderPlant();
       if (view==='hatch') renderHatch();
       if (view==='sell') renderSell();
+      if (view==='feed') renderFeed();
       if (view==='settings') renderSettings();
     }
     if(footer.textContent!==status)footer.textContent=status;
@@ -917,6 +1138,46 @@
     const eligible=pets.filter(p=>!saleReason(p,inventory,settings.protect,catalog));
     content.append(el('div',{class:'summary',text:`인벤토리 ${pets.length}마리 · 판매 대상 ${eligible.length}마리`}),button('펫 판매',()=>void sell(),'primary'),el('small',{text:'판매 대상에 Rainbow가 있으면 실행 전에 한 번 확인합니다.'}));
   }
+  function renderFeed() {
+    content.append(row('펫 먹이',switchFor(settings.autoFeed,setAutoFeed,'펫 먹이 자동 지급'),'사용 중인 펫 · 배고픔 5% 미만'),
+      el('small',{text:'알림 후 1~5초 대기 · 여러 펫은 2초 간격 · 일반 먹이 우선, 없으면 Hunger Potion'}),
+      el('small',{text:'선택한 먹이만 잠금 해제하고, 남아 있으면 다시 잠급니다.'}));
+    const groups=petFoodGroups(catalog);
+    if(!groups.length)content.append(el('p',{text:'동물과 먹이 정보를 불러오는 중입니다.'}));
+    function folded(key,id,label,className) {
+      const details=el('details',{class:className,open:settings.feed[key].includes(id)});
+      details.append(el('summary',{},label));
+      details.addEventListener('toggle',()=>{
+        if(!details.isConnected)return;
+        settings.feed[key]=settings.feed[key].filter(v=>v!==id);if(details.open)settings.feed[key].push(id);save();placePanel();
+      });
+      return details;
+    }
+    for(const group of groups) {
+      const price=meta('Egg',group.id).coinPrice;
+      const egg=folded('openEggs',group.id,el('span',{text:group.id==='Other'?'기타 동물':`${title('Egg',group.id)}${finite(price)?` · ${price.toLocaleString()} 코인`:''}` }),'shop-category feed-egg');
+      egg.dataset.egg=group.id;
+      const body=el('div',{class:'category-body'});egg.append(body);
+      for(const {species,probability} of group.pets) {
+        const animal=folded('openPets',`${group.id}:${species}`,itemLabel('Pet',species,probability===null?'알 정보 없음':`등장 확률 ${Number(probability.toFixed(2))}%`),'feed-pet');
+        animal.dataset.species=species;
+        const diet=[...new Set(catalog.pets?.[species]?.diet || [])];
+        for(const [type,id] of [...diet.map(id=>['Produce',id]),['Tool','ReplenishPotion']]) {
+          const key=foodKey(species,type,id);
+          animal.append(el('div',{class:'row'},itemLabel(type,id,''),switchFor(settings.feed.allowed[key]!==false,v=>{
+            settings.feed.allowed[key]=v;observeFeed();
+          },`${title('Pet',species)} · ${title(type,id)} 먹이`)));
+        }
+        body.append(animal);
+      }
+      content.append(egg);
+    }
+    content.append(el('h3',{text:'Discord 웹후크'}),row('먹이 알림',switchFor(settings.feed.webhook.enabled,v=>settings.feed.webhook.enabled=v,'펫 먹이 웹후크'),'배고픔·급식 완료·급식 중단 알림'),
+      el('input',{type:'password',placeholder:'https://discord.com/api/webhooks/…',value:settings.feed.webhook.url,ariaLabel:'펫 먹이 웹후크 주소',onchange:e=>{
+        try{const value=e.target.value.trim();if(value)webhookURL(value);settings.feed.webhook.url=value;save();report('펫 먹이 웹후크 주소 저장됨');}
+        catch(error){report(error.message);e.target.value=settings.feed.webhook.url;}
+      }}));
+  }
   function renderSettings() {
     let teams=[];try{teams=game.data().petTeams||[];}catch{}
     const options=teams.map(t=>[String(t.id),t.name||String(t.id)]);
@@ -951,9 +1212,10 @@
   }
   function importSettings(text) {
     if(running)throw Error('진행 중인 작업이 끝난 뒤 설정을 불러오세요.');
-    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;validateTeamSettings();save();syncEggs();placeIcon();refresh(true);report('모든 설정을 불러왔습니다.');
+    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;clearFeeding();validateTeamSettings();save();syncEggs();placeIcon();refresh(true);report('모든 설정을 불러왔습니다.');
     if(!settings.autoBuy)pendingBuy.clear();
     if(settings.autoBuy&&!wasBuy){void loadCatalog();void loadLive();scheduleBuy();}
+    if(settings.autoFeed)void loadCatalog().then(observeFeed);
   }
   function askRainbow(pets) {
     panel.hidden=false;
@@ -1014,9 +1276,10 @@
       .body{padding:0 10px 9px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#ffffff28 transparent;min-height:0}.home .body{padding:4px 10px 8px;border-top:1px solid #ffffff16}.menu-row{display:flex;align-items:center;min-height:34px;gap:8px}.menu-link{flex:1;text-align:left;background:none;border:0;font-weight:500;padding:6px 0;border-radius:4px}.menu-link:hover{background:#ffffff06}.pill{font-size:12px;min-width:43px;padding:4px 7px;border:1px solid #ffffff25;background:#ffffff06}
       .row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #ffffff0d}.grow{flex:1;min-width:0}.label{font-weight:500;overflow-wrap:anywhere}small{display:block;font-size:11px;color:#97a39f;line-height:1.4;margin-top:2px}p{font-size:12px;color:#b1bab7;margin:7px 0 9px}h3{font-size:12px;color:#b7c9bf;margin:12px 0 4px;font-weight:600}h2{font-size:17px;margin-top:0}
       .rooms{display:flex;gap:6px;padding-top:8px;margin-top:5px;border-top:1px solid #ffffff16}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
+      .feed-pet{border-top:1px solid #ffffff14}.feed-pet>summary{padding:7px 0;background:none}.feed-pet>summary .item{min-width:0}.feed-pet>.row{padding:5px 0 5px 10px}.feed-pet>.row small:empty{display:none}
       .switch{display:inline-flex;flex:none;position:relative;width:35px;height:21px;cursor:pointer}.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.switch span{width:35px;height:21px;border-radius:12px;background:#ffffff24;pointer-events:none}.switch span:after{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#d7dedb;margin:3px;transition:transform .15s}.switch input:checked+span{background:#498060}.switch input:checked+span:after{transform:translateX(14px);background:#f1fff6}.switch input:focus-visible+span{outline:2px solid #6caf84;outline-offset:3px}
       select,input:not([type=checkbox]){background:#161d1acc;border:1px solid #ffffff26;border-radius:4px;padding:5px;max-width:100%;min-width:0}select option{background:#252e29;color:#e5e8e9}.row select{max-width:175px}.row input[type=number]{width:84px}.body>input{width:100%;margin:8px 0}.body>button{margin:6px 5px 3px 0}.primary{background:#3e664b;border-color:#6a9876;color:#f2fff6}.primary:hover{background:#4a775a}.item{display:flex;align-items:center;gap:9px;flex:1;min-width:0}.item img,.fallback{width:25px;height:25px;object-fit:contain;image-rendering:pixelated;flex:none}.fallback{text-align:center;line-height:25px}.grip{color:#88998f;cursor:grab;user-select:none}.arrows{display:flex;flex-direction:column;gap:2px}.arrows button{font-size:10px;padding:0 5px;border-radius:4px}
-      .shop-category{margin-top:7px;border:1px solid #ffffff1b;border-radius:5px;overflow:hidden}.shop-category summary{cursor:pointer;display:flex;align-items:center;gap:7px;padding:7px 8px;background:#ffffff05;list-style:none;font-weight:600;user-select:none}.shop-category summary::-webkit-details-marker{display:none}.shop-category summary:before{content:'›';font-size:17px;line-height:1;color:#9eaea4;transition:transform .12s}.shop-category[open] summary:before{transform:rotate(90deg)}.shop-category summary small{margin:0 0 0 auto;font-size:10px;font-weight:400}.category-body{padding:0 8px}.category-body .row:last-child{border-bottom:0}
+      .shop-category{margin-top:7px;border:1px solid #ffffff1b;border-radius:5px;overflow:hidden}.shop-category summary{cursor:pointer;display:flex;align-items:center;gap:7px;padding:7px 8px;background:#ffffff05;list-style:none;font-weight:600;user-select:none}.shop-category summary::-webkit-details-marker{display:none}.shop-category summary:before{content:'›';font-size:17px;line-height:1;color:#9eaea4;transition:transform .12s}.shop-category[open]>summary:before,.feed-pet[open]>summary:before{transform:rotate(90deg)}.shop-category summary small{margin:0 0 0 auto;font-size:10px;font-weight:400}.category-body{padding:0 8px}.category-body .row:last-child{border-bottom:0}
       .summary{padding:8px;background:#ffffff08;border:1px solid #ffffff13;border-radius:5px;margin:8px 0}footer{padding:6px 10px;border-top:1px solid #ffffff16;font-size:10px;color:#a7b7ad;background:#00000012;overflow-wrap:anywhere;flex:none;max-height:75px;overflow:auto}pre{white-space:pre-wrap;font-size:10px;line-height:1.8;color:#99aaa0;max-height:160px;overflow:auto}.overlay{position:fixed;inset:0;background:#10171299;display:grid;place-items:center;z-index:2147483646}.dialog{background:#262e28;border:1px solid #ffffff24;border-radius:8px;padding:15px;width:370px;max-width:calc(100vw - 24px);box-shadow:0 20px 80px #0007}.dialog ul{max-height:200px;overflow:auto;padding-left:20px}.actions{display:flex;justify-content:flex-end;gap:8px}@media(max-width:520px){.panel{max-height:calc(100dvh - 16px)}.body{padding:0 10px 9px}.row select{max-width:170px}}
     `});
     icon=button('🐌',()=>{panel.hidden=!panel.hidden;if(!panel.hidden)refresh();},'icon');icon.setAttribute('aria-label','Snail in Cherry 열기');
@@ -1032,7 +1295,7 @@
     panel=el('section',{class:'panel',hidden:true,ariaLabel:'Snail in Cherry'},el('header',{},
       el('div',{class:'brand'},el('strong',{text:'Snail in Cherry',class:'title-handle',title:'드래그하여 창 이동'}),button('×',()=>panel.hidden=true)),
       el('div',{class:'badges'},el('span',{class:'connection',text:'○ 연결 대기'}),el('span',{class:'version',text:VERSION})),
-      el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}),button('중지',()=>{if(running)running.cancel=true;report('현재 요청 확인 후 중지합니다.');},'stop'))),content,footer);
+      el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}),button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed'){setAutoFeed(false);save();}}report('현재 요청 확인 후 중지합니다.');},'stop'))),content,footer);
     enablePanelDrag(panel.querySelector('header'));
     shadow.append(style,icon,panel);placeIcon();window.addEventListener('resize',()=>{placeIcon();placePanel();});refresh();void loadCatalog();
   }
