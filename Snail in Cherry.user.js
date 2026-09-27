@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.7
+// @version      1.4.8
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -28,7 +28,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.7', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.8', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -986,7 +986,7 @@
       const initial = game.stock(shop,id);
       const target = initial.available;
       try {
-        for (let i=0; i<target; i++) {
+        do {
           checkJob(job);
           if (!settings.buy[choiceKey(item)]) break;
           const data = game.data(), before = game.stock(shop,id);
@@ -995,19 +995,22 @@
           if (!before.available) { reason='재고 부족'; break; }
           if (before.cycle !== initial.cycle) { reason='재입고 감지 · 다음 검사에서 계속'; break; }
           const price = before.item.coinPrice ?? meta(type,id).coinPrice;
-          if (finite(price) && finite(data.coinsCount) && data.coinsCount < price) { reason='잔액 부족'; break; }
+          const affordable=finite(price) && price>0 && finite(data.coinsCount)?Math.floor(data.coinsCount/price):Infinity;
+          const amount=Math.max(0,Math.floor(Math.min(before.available,capacity.remaining,affordable)));
+          if (!amount) { reason='잔액 부족'; break; }
           if (data.inventory.items.filter(Boolean).length >= CAPACITY && !data.inventory.items.some(i => i?.itemType === type && itemId(i) === id)) { reason='인벤토리 가득 참'; break; }
-          report(`${title(type,id)} 구매 중 · ${confirmed}/${target}`);
-          sent++;
-          // As in Arie's Mod: one purchase request per unit, no per-unit random delay.
-          // Wait only for the authoritative acknowledgement and stock change.
-          await game.command('PurchaseShopItem',{ shop,viewMode:shopViewMode(page,shop),item:{ itemType:type,[FIELDS[type]]:id } },next => {
+          if(amount<target)reason=capacity.remaining<=affordable?'소지 한도에 맞춰 구매':'잔액에 맞춰 구매';
+          report(`${title(type,id)} 모두 구매 중 · ${amount}개`);
+          sent=amount;
+          // Arie's Mod 3.2.219 ShopsService.buy: one command carries the full quantity.
+          // Like the game, omit quantity for a single unit. Never retry an unconfirmed batch.
+          await game.command('PurchaseShopItem',{ shop,viewMode:shopViewMode(page,shop),item:{ itemType:type,[FIELDS[type]]:id },...(amount===1?{}:{quantity:amount}) },next => {
             const after = game.stock(shop,id);
-            return after.cycle === before.cycle && after.restockId===before.restockId && after.bought > before.bought &&
-              (!(Number.isFinite(capacity.limit) || settings.autoStore) || purchaseCapacity(next,item,meta(type,id)).held > capacity.held);
+            if(after.cycle!==before.cycle || after.restockId!==before.restockId)return false;
+            confirmed=Math.max(confirmed,Math.max(0,Math.min(amount,after.bought-before.bought,purchaseCapacity(next,item,meta(type,id)).held-capacity.held)));
+            return confirmed===amount;
           });
-          confirmed++;
-        }
+        } while(false);
       } catch(error) {
         reason=error.message;
         throw Error(`${title(type,id)} 구매 실패 (${shop}/${id}) · ${reason}`);
@@ -1020,6 +1023,7 @@
         if (sent) notifyPurchase(type,id,sent,confirmed,reason);
         report(`${title(type,id)} · 구매 확인 ${confirmed}개${reason ? ` · ${reason}` : ''}${storageNote ? ` · ${storageNote}` : ''}`);
       }
+      checkJob(job);
     }
     if (!attempted && !capped) report(shopRows().some(r=>settings.buy[choiceKey(r.item)] && !r.ready)?'상점 구매 대기 · 최신 입고 정보 동기화 중':'상점 구매 대기 · 선택 품목 재고 없음');
   }
