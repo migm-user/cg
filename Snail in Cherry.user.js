@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.6
+// @version      1.4.7
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -28,7 +28,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.6', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.7', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -39,7 +39,7 @@
   const quantity = item => finite(item?.quantity) ? Math.max(0, item.quantity) : 1;
   const itemId = item => String(item?.[FIELDS[item?.itemType]] || '');
   const choiceKey = item => `${item.itemType}:${itemId(item)}`;
-  // Public /data verified 2026-09-22; used only when catalog fields are absent.
+  // Public /data verified 2026-09-27 (v1294); used only when catalog fields are absent.
   const TOOL_LIMIT_FALLBACK = {
     WateringCan:99,CropCleanser:99,ChilledPotion:99,FrozenPotion:99,
     ReplenishPotion:99,XPPotion:99,RainbowPotion:99,
@@ -279,12 +279,38 @@
     const time = Number(value);
     return time > 0 && Number.isFinite(time) && (time < 1e11 ? time * 1000 : time) <= now;
   }
+  function purchaseRecord(shop,record,staleMarker='') {
+    const modern=own(shop,'restockId') || own(record,'restockId');
+    if(modern) {
+      const restockId=shop?.restockId;
+      const loaded=typeof restockId==='string' && !!restockId && shop?.open!==false;
+      const matches=loaded && record?.restockId===restockId;
+      // Old purchase records now survive restocks. Never subtract them from new stock.
+      // A newer/mismatched snapshot is unknown: wait for the matching shop frame.
+      const older=finite(record?.startedAtMs) && finite(shop?.startedAtMs) && record.startedAtMs<shop.startedAtMs;
+      return {modern,restockId,ready:loaded && (!record || matches || older),counts:matches?record.purchases || {}:{},epoch:Number(shop?.startedAtMs || 0)};
+    }
+    const stale=staleMarker && staleMarker===JSON.stringify(record || {});
+    return {modern,restockId:undefined,ready:shop?.open!==false,counts:stale?{}:record?.purchases || {},epoch:Number(record?.createdAt || 0)};
+  }
   function stock(root, data, shop, id, staleMarker = '') {
-    const item = root?.child?.data?.shops?.[shop]?.inventory?.find(i => itemId(i) === id);
-    const record = data?.shopPurchases?.[shop];
-    const stale = staleMarker && staleMarker === JSON.stringify(record || {});
-    const bought = stale ? 0 : Number(record?.purchases?.[id] || 0);
-    return { item, bought, available: item && finite(item.initialStock) ? Math.max(0,item.initialStock-bought) : 0, epoch: Number(record?.createdAt || 0) };
+    const value=root?.child?.data?.shops?.[shop];
+    const item=Array.isArray(value?.inventory)?value.inventory.find(i=>itemId(i)===id):undefined;
+    const record=purchaseRecord(value,data?.shopPurchases?.[shop],staleMarker);
+    const bought=Math.max(0,Number(record.counts[id]) || 0);
+    return {item,bought,available:record.ready && item && finite(item.initialStock)?Math.max(0,item.initialStock-bought):0,epoch:record.epoch,restockId:record.restockId,ready:record.ready};
+  }
+  function shopViewMode(page,shop) {
+    try {
+      const storage=page.localStorage;
+      for(let i=0;i<storage.length;i++) {
+        const key=storage.key(i),match=/^shop:.*:([^:]+):viewMode$/.exec(key || '');
+        if(!match || match[1]!==shop)continue;
+        let value=storage.getItem(key);try{value=JSON.parse(value);}catch{}
+        if(value==='list' || value==='grid')return value;
+      }
+    }catch{}
+    return 'list';
   }
   const members = team => (Array.isArray(team?.members) ? team.members : []).map(m => String(m?.petId || '')).filter(Boolean).sort();
   // Native v1240 teams are part of the current player's authoritative data.
@@ -556,22 +582,24 @@
         if (!value) continue;
         const left = Number(value.secondsUntilRestock), marker = JSON.stringify(purchases?.[shop] || {});
         const previous = this.shopWatch.get(shop);
+        const snapshot=purchaseRecord(value,purchases?.[shop]);
         const inventorySignature=JSON.stringify(value.inventory||[]);
         const changedInventory=previous && previous.inventorySignature!==inventorySignature;
-        const resetDetected = previous && ((Number.isFinite(left) && Number.isFinite(previous.left) && left > previous.left+2) || changedInventory);
+        const resetDetected = previous && (snapshot.modern ? previous.restockId!==snapshot.restockId : ((Number.isFinite(left) && Number.isFinite(previous.left) && left > previous.left+2) || changedInventory));
         // Inventory and countdown can arrive in separate frames for one restock.
-        const restocked=resetDetected && (!previous.lastRestockAt || Date.now()-previous.lastRestockAt>3000);
+        const restocked=resetDetected && (snapshot.modern || !previous.lastRestockAt || Date.now()-previous.lastRestockAt>3000);
         let stale = previous?.stale || '';
-        if (restocked && previous.marker === marker) stale = marker;
+        if(snapshot.modern)stale='';
+        else if (restocked && previous.marker === marker) stale = marker;
         if (stale && stale !== marker) stale = '';
-        const record=purchases?.[shop]||{},counts={...(record.purchases||{})},epoch=Number(record.createdAt||0);
-        if(restocked)events.restocked.push(shop);
-        if(previous && !stale)for(const item of value.inventory||[]) {
+        const record=purchaseRecord(value,purchases?.[shop],stale),counts={...record.counts},epoch=record.epoch;
+        if(snapshot.modern ? snapshot.ready && (restocked || !previous || !previous.ready || changedInventory) : restocked)events.restocked.push(shop);
+        if(previous && !stale)for(const item of Array.isArray(value.inventory)?value.inventory:[]) {
           if(item?.itemType!=='Egg')continue;
-          const id=itemId(item),before=(previous.stale || previous.epoch!==epoch)?0:Number(previous.counts?.[id]||0);
+          const id=itemId(item),before=(previous.stale || previous.epoch!==epoch || previous.restockId!==snapshot.restockId)?0:Number(previous.counts?.[id]||0);
           if(Number(counts[id]||0)>before)events.eggPurchases.push({shop,id,quantity:Number(counts[id])-before});
         }
-        this.shopWatch.set(shop,{left,marker,stale,counts,epoch,inventorySignature,lastRestockAt:restocked?Date.now():previous?.lastRestockAt||0,cycle:(previous?.cycle || 0)+(restocked ? 1 : 0)});
+        this.shopWatch.set(shop,{left,marker,stale,counts,epoch,restockId:snapshot.restockId,ready:snapshot.ready,inventorySignature,lastRestockAt:restocked?Date.now():previous?.lastRestockAt||0,cycle:(previous?.cycle || 0)+(restocked ? 1 : 0)});
       }
       return events;
     }
@@ -611,7 +639,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -973,9 +1001,9 @@
           sent++;
           // As in Arie's Mod: one purchase request per unit, no per-unit random delay.
           // Wait only for the authoritative acknowledgement and stock change.
-          await game.command('PurchaseShopItem',{ shop,item:{ itemType:type,[FIELDS[type]]:id } },next => {
+          await game.command('PurchaseShopItem',{ shop,viewMode:shopViewMode(page,shop),item:{ itemType:type,[FIELDS[type]]:id } },next => {
             const after = game.stock(shop,id);
-            return after.cycle === before.cycle && after.bought > before.bought &&
+            return after.cycle === before.cycle && after.restockId===before.restockId && after.bought > before.bought &&
               (!(Number.isFinite(capacity.limit) || settings.autoStore) || purchaseCapacity(next,item,meta(type,id)).held > capacity.held);
           });
           confirmed++;
@@ -993,7 +1021,7 @@
         report(`${title(type,id)} · 구매 확인 ${confirmed}개${reason ? ` · ${reason}` : ''}${storageNote ? ` · ${storageNote}` : ''}`);
       }
     }
-    if (!attempted && !capped) report('상점 구매 대기 · 선택 품목 재고 없음');
+    if (!attempted && !capped) report(shopRows().some(r=>settings.buy[choiceKey(r.item)] && !r.ready)?'상점 구매 대기 · 최신 입고 정보 동기화 중':'상점 구매 대기 · 선택 품목 재고 없음');
   }
   async function plant(job) {
     syncEggs(); let done=0;
@@ -1113,7 +1141,7 @@
   function shopRows() {
     let data; try { data=game.data(); } catch { return []; }
     return Object.entries(game.root.child.data.shops || {}).flatMap(([shop,value]) =>
-      (value.inventory || []).filter(i => FIELDS[i?.itemType] && itemId(i)).map(item => {
+      (Array.isArray(value?.inventory)?value.inventory:[]).filter(i => FIELDS[i?.itemType] && itemId(i)).map(item => {
         const id=itemId(item); return { shop,id,item,...game.stock(shop,id) };
       }));
   }
