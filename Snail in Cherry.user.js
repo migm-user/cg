@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.8
+// @version      1.4.10
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -28,7 +28,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.8', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.4.10', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -55,6 +55,8 @@
     return {held,limit,remaining:Math.max(0,limit-held)};
   }
   const STORAGE_FOR = { Seed:'SeedSilo',Tool:'ToolShack',Decor:'DecorShed' };
+  // v1422 MoveItem uses catalog keys for stacks; lock commands still use individual IDs.
+  const moveItemKey = item => FIELDS[item?.itemType] ? itemId(item) : String(item?.id || '');
   const storageItems = storage => Array.isArray(storage?.items) ? storage.items : [];
   const storageCount = (storage,item) => storageItems(storage).reduce((sum,entry) =>
     sum+(entry && (!entry.itemType || entry.itemType===item.itemType) && entry[FIELDS[item.itemType]]===itemId(item) ? quantity(entry) : 0),0);
@@ -77,7 +79,7 @@
     if(!merges && storageItems(storage).filter(Boolean).length>=slots)return {reason:'보관함 가득 참 · 인벤토리 유지'};
     const entry=entries.find(i=>!i.locked && !(data.inventory.favoritedItemIds || []).includes(i.id || itemId(i)));
     if(!entry)return {reason:'잠긴 품목 · 인벤토리 유지'};
-    return {storage,storageId,held,amount:Math.min(amount,quantity(entry)),itemKey:item.itemType==='Tool' ? entry.id || itemId(entry) : itemId(entry)};
+    return {storage,storageId,held,amount:Math.min(amount,quantity(entry)),itemKey:moveItemKey(entry)};
   }
   const defaults = () => ({
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
@@ -902,12 +904,13 @@
       if(selected.storageId) {
         const data=game.data();
         if(data.inventory.items.filter(Boolean).length>=CAPACITY)throw Error('인벤토리 가득 참 · 먹이를 꺼낼 수 없습니다.');
-        const key=food.id || food.toolId,prior=quantity(food);
+        const key=moveItemKey(food),prior=quantity(food);
+        if(!key)throw Error('먹이 이동 식별자 확인 대기');
         // Food UUIDs are retained by retrieval; potions may merge into an existing stack.
         const owned=food.itemType==='Tool'?purchaseCapacity(data,food).held:quantity(data.inventory.items.find(i=>i?.id===food.id) || {quantity:0});
-        await game.command('RetrieveItemFromStorage',{itemId:key,storageId:selected.storageId,quantity:1},next=> {
+        await game.command('MoveItem',{from:selected.storageId,to:'inventory',itemId:key,quantity:1},next=> {
           const source=next.inventory.storages?.find(s=>(s.decorId || s.id)===selected.storageId);
-          const left=storageItems(source).find(i=>(i.id || i.toolId)===key);
+          const left=storageItems(source).find(i=>moveItemKey(i)===key);
           const now=food.itemType==='Tool'?purchaseCapacity(next,food).held:quantity(next.inventory.items.find(i=>i?.id===food.id) || {quantity:0});
           return now>owned && (!left || quantity(left)<prior);
         },12000,{stateConfirms:true});
@@ -1051,7 +1054,7 @@
       const plan=storagePlan(game.data(),item,purchased-moved,heldBefore,catalog.decor?.[STORAGE_FOR[item.itemType]]);
       if(!plan.storage)return [moved?`보관함 ${moved}개 이동`:'',plan.reason].filter(Boolean).join(' · ');
       const before=storageCount(plan.storage,item);
-      await game.command('PutItemInStorage',{itemId:plan.itemKey,storageId:plan.storageId,quantity:plan.amount},next=> {
+      await game.command('MoveItem',{from:'inventory',to:plan.storageId,itemId:plan.itemKey,quantity:plan.amount},next=> {
         const storage=next.inventory.storages?.find(s=>(s?.decorId || s?.id)===plan.storageId);
         return storageCount(storage,item)>=before+plan.amount && purchaseCapacity(next,item).held<=plan.held-plan.amount;
       },12000,{stateConfirms:true});
@@ -1188,6 +1191,7 @@
     if (!content) return;
     shadow.querySelector('.connection').textContent=game.root?'● 연결됨':'○ 연결 대기';
     shadow.querySelector('.stop').hidden=!running;
+    placePanel();
     // Team options must still follow server patches while a select or text field
     // has focus. Update these controls in place without discarding the user's edit.
     if(view==='settings')syncTeamControls();
@@ -1531,7 +1535,7 @@
       *{box-sizing:border-box}[hidden]{display:none!important}button,input,select{font:inherit;color:inherit}button{cursor:pointer;border:1px solid #ffffff24;background:#ffffff07;border-radius:5px;padding:5px 8px;transition:background .12s}button:hover{background:#ffffff13;border-color:#ffffff40}button:disabled{opacity:.4;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid #6caf84;outline-offset:2px}
       .icon{position:fixed;width:44px;height:44px;padding:0;border-radius:50%;background:#293229ed;color:#fff;font-size:24px;box-shadow:0 5px 18px #0005;z-index:2147483644;touch-action:none;user-select:none;cursor:grab}
       .panel{position:fixed;right:76px;top:68px;width:340px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);display:flex;flex-direction:column;background:linear-gradient(135deg,#242821f5,#22262ef5);backdrop-filter:blur(16px);border:1px solid #ffffff1c;border-radius:8px;box-shadow:0 14px 40px #0005;z-index:2147483645;overflow:hidden}.panel.home{width:224px}
-      header{padding:9px 10px 0;flex:none;cursor:move;touch-action:none;user-select:none}.brand{display:flex;align-items:center;justify-content:space-between;gap:8px}.brand strong{font-size:13px;font-weight:650;flex:1;padding:5px 0;letter-spacing:-.2px}.brand button{font-size:17px;line-height:1;width:25px;height:25px;padding:0;color:#c7cccd;cursor:pointer}.badges{display:flex;align-items:center;gap:7px;margin:6px 0 8px}.badges span{font-size:11px;border:1px solid #4b8562;background:#32544044;border-radius:5px;padding:2px 6px;color:#e0eee5}.subhead{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid #ffffff16;cursor:default}.page-name{flex:1;font-size:12px;color:#aeb8b4}.home .subhead{padding:0;border-top:0}.home .page-name{display:none}.back{font-size:11px;padding:4px 8px}.stop{font-size:11px;color:#f0c8c2;border-color:#8c635f;margin:5px 0}
+      header{padding:9px 10px 0;flex:none;cursor:move;touch-action:none;user-select:none}.brand{display:flex;align-items:center;justify-content:space-between;gap:8px}.brand strong{font-size:13px;font-weight:650;flex:1;padding:5px 0;letter-spacing:-.2px}.brand button{font-size:17px;line-height:1;width:25px;height:25px;padding:0;color:#c7cccd;cursor:pointer}.badges{display:flex;align-items:center;gap:7px;margin:6px 0 8px}.badges span{font-size:11px;border:1px solid #4b8562;background:#32544044;border-radius:5px;padding:2px 6px;color:#e0eee5}.subhead{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid #ffffff16;cursor:default}.page-name{flex:1;font-size:12px;color:#aeb8b4}.home .subhead{padding:0;border-top:0}.home .page-name{display:none}.back{font-size:11px;padding:4px 8px}.stop{font-size:11px;color:#f0c8c2;border-color:#8c635f;margin:6px 10px;align-self:flex-end;flex:none}
       .body{padding:0 10px 9px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#ffffff28 transparent;min-height:0}.home .body{padding:4px 10px 8px;border-top:1px solid #ffffff16}.menu-row{display:flex;align-items:center;min-height:34px;gap:8px}.menu-link{flex:1;text-align:left;background:none;border:0;font-weight:500;padding:6px 0;border-radius:4px}.menu-link:hover{background:#ffffff06}.pill{font-size:12px;min-width:43px;padding:4px 7px;border:1px solid #ffffff25;background:#ffffff06}
       .row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #ffffff0d}.grow{flex:1;min-width:0}.label{font-weight:500;overflow-wrap:anywhere}small{display:block;font-size:11px;color:#97a39f;line-height:1.4;margin-top:2px}p{font-size:12px;color:#b1bab7;margin:7px 0 9px}h3{font-size:12px;color:#b7c9bf;margin:12px 0 4px;font-weight:600}h2{font-size:17px;margin-top:0}
       .manual-team-input{display:flex;gap:4px;flex:1;min-width:0}.manual-team-input input{width:0;flex:1}.manual-team-input button{flex:none;font-size:10px;padding:4px 5px}.manual-team-current{overflow-wrap:anywhere;padding:5px 0}.manual-teams .category-body>small{padding-top:5px}
@@ -1555,7 +1559,8 @@
     panel=el('section',{class:'panel',hidden:true,ariaLabel:'Snail in Cherry'},el('header',{},
       el('div',{class:'brand'},el('strong',{text:'Snail in Cherry',class:'title-handle',title:'드래그하여 창 이동'}),button('×',()=>panel.hidden=true)),
       el('div',{class:'badges'},el('span',{class:'connection',text:'○ 연결 대기'}),el('span',{class:'version',text:VERSION})),
-      el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}),button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed')setAutoFeed(false);if(running.kind==='buy')setAutoBuy(false);save();}report('현재 요청 확인 후 중지합니다.');},'stop'))),content,footer);
+      el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}))),content,footer,
+      button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed')setAutoFeed(false);if(running.kind==='buy')setAutoBuy(false);save();}report('현재 요청 확인 후 중지합니다.');},'stop'));
     enablePanelDrag(panel.querySelector('header'));
     shadow.append(style,icon,panel);placeIcon();window.addEventListener('resize',()=>{placeIcon();placePanel();});refresh();void loadCatalog();
   }
