@@ -2,13 +2,14 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.4.10
-// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이와 설정 백업
+// @version      1.5.0
+// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
 // @match        https://starweaver.org/r/*
 // @run-at       document-start
+// @inject-into  page
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -28,7 +29,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.4.10', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.5.0', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -649,7 +650,26 @@
   let settings;
   try { settings = settingsFrom(GM_getValue(KEY,defaults())); } catch { settings = defaults(); }
   let catalog = {}, catalogAt = 0, catalogPromise = null, catalogRetryAt = 0, catalogETag = '', running = null, status = '게임 연결 대기', view = 'home';
-  let liveInfo={},liveAt=0,livePromise=null,liveRetryAt=0;
+  let liveInfo={},liveAt=0,livePromise=null,liveRetryAt=0,homePage=0;
+  const skinsAPI=()=>page.__SNAIL_WITH_SKINS__;
+  function syncSkinsControl() {
+    const control=shadow?.querySelector('input[aria-label="스킨·숨기기 전체 적용"]');
+    if(control){control.disabled=!skinsAPI()?.setEnabled;control.checked=!!skinsAPI()?.getConfig?.().enabled;}
+  }
+  function setSkinsEnabled(value) {
+    const api=skinsAPI();
+    if(!api?.setEnabled){report('스킨 기능 준비 중입니다.');return;}
+    Promise.resolve(api.setEnabled(value)).catch(error=>report(error.message));syncSkinsControl();
+  }
+  function openSkins() {
+    const api=skinsAPI();
+    if(api?.setPanelOpen){api.setPanelOpen(true);return;}
+    // Reuse an already running standalone instance without a second renderer hook.
+    const host=document.querySelector('#snail-with-skins'),skinPanel=host?.shadowRoot?.querySelector('.panel');
+    if(skinPanel){host.shadowRoot.querySelector('.launcher')?.remove();host.style.zIndex='2147483646';skinPanel.hidden=false;return;}
+    report('스킨 UI 준비 중입니다. 잠시 뒤 다시 눌러 주세요.');
+  }
+  page.addEventListener('snail-with-skins:config-change',syncSkinsControl);
   let panel, content, footer, icon, shadow, lastPaint = 0, paintTimer=null;
   const pendingBuy=new Set();let drainTimer=null,draining=false,readyGeneration=-1;
   const pendingFeed=new Map(),feedStates=new Map();let feedTimer=null,lastFeedAt=0;
@@ -1189,6 +1209,7 @@
   }
   function refresh(force = false) {
     if (!content) return;
+    syncSkinsControl();
     shadow.querySelector('.connection').textContent=game.root?'● 연결됨':'○ 연결 대기';
     shadow.querySelector('.stop').hidden=!running;
     placePanel();
@@ -1203,14 +1224,20 @@
     shadow.querySelector('.page-name').textContent=names[view];
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
-      for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['feed','펫 먹이','🍽️'],['settings','설정','⚙️']]) {
+      if(homePage===0)for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['feed','펫 먹이','🍽️'],['settings','설정','⚙️']]) {
         const control=key==='feed'?switchFor(settings.autoFeed,setAutoFeed,'펫 먹이 자동 지급'):key==='buy' ? switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매') :
           button(key==='plant'?'심기':key==='hatch'?'부화':key==='sell'?'판매':'⚙️',() => key==='plant'?void run('plant',plant):key==='hatch'?hatchAll():key==='sell'?void sell():go('settings'),'pill');
         content.append(el('div',{ class:'menu-row' },button(`${glyph}  ${name}`,()=>go(key),'menu-link'),control));
       }
+      if(homePage===1)content.append(el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),
+        switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')));
       content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...[
         ['연화','Yeonhwa'],['채리','Cherry'],['혜','Hye']
       ].map(([name,room])=>el('a',{text:name,href:`https://magicgarden.gg/r/${room.toLowerCase()}`,title:`${room} 방으로 이동`} ))));
+      const previous=button('◀',()=>{homePage=0;refresh(true);});previous.setAttribute('aria-label','이전 메뉴 페이지');previous.disabled=homePage===0;
+      const next=button('▶',()=>{homePage=1;refresh(true);});next.setAttribute('aria-label','다음 메뉴 페이지');next.disabled=homePage===1;
+      content.append(el('nav',{class:'menu-pages',ariaLabel:'메뉴 페이지 전환'},previous,el('span',{text:`${homePage+1} / 2`}),next));
+      syncSkinsControl();
     } else {
       if (view==='buy') renderBuy();
       if (view==='plant') renderPlant();
@@ -1540,6 +1567,7 @@
       .row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #ffffff0d}.grow{flex:1;min-width:0}.label{font-weight:500;overflow-wrap:anywhere}small{display:block;font-size:11px;color:#97a39f;line-height:1.4;margin-top:2px}p{font-size:12px;color:#b1bab7;margin:7px 0 9px}h3{font-size:12px;color:#b7c9bf;margin:12px 0 4px;font-weight:600}h2{font-size:17px;margin-top:0}
       .manual-team-input{display:flex;gap:4px;flex:1;min-width:0}.manual-team-input input{width:0;flex:1}.manual-team-input button{flex:none;font-size:10px;padding:4px 5px}.manual-team-current{overflow-wrap:anywhere;padding:5px 0}.manual-teams .category-body>small{padding-top:5px}
       .rooms{display:flex;gap:6px;padding-top:8px;margin-top:5px;border-top:1px solid #ffffff16}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
+      .menu-pages{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid #ffffff16;margin-top:8px;padding-top:8px}.menu-pages button{padding:3px 13px}.menu-pages span{font-size:11px;color:#a7b7ad}.menu-pages button:disabled{opacity:.35;cursor:default}
       .feed-pet{border-top:1px solid #ffffff14}.feed-pet>summary{padding:7px 0;background:none}.feed-pet>summary .item{min-width:0}.feed-pet>.row{padding:5px 0 5px 10px}.feed-pet>.row small:empty{display:none}
       .switch{display:inline-flex;flex:none;position:relative;width:35px;height:21px;cursor:pointer}.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.switch span{width:35px;height:21px;border-radius:12px;background:#ffffff24;pointer-events:none}.switch span:after{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#d7dedb;margin:3px;transition:transform .15s}.switch input:checked+span{background:#498060}.switch input:checked+span:after{transform:translateX(14px);background:#f1fff6}.switch input:focus-visible+span{outline:2px solid #6caf84;outline-offset:3px}
       select,input:not([type=checkbox]){background:#161d1acc;border:1px solid #ffffff26;border-radius:4px;padding:5px;max-width:100%;min-width:0}select option{background:#252e29;color:#e5e8e9}.row select{max-width:175px}.row input[type=number]{width:84px}.body>input{width:100%;margin:8px 0}.body>button{margin:6px 5px 3px 0}.primary{background:#3e664b;border-color:#6a9876;color:#f2fff6}.primary:hover{background:#4a775a}.item{display:flex;align-items:center;gap:9px;flex:1;min-width:0}.item img,.fallback{width:25px;height:25px;object-fit:contain;image-rendering:pixelated;flex:none}.fallback{text-align:center;line-height:25px}.grip{color:#88998f;cursor:grab;user-select:none}.arrows{display:flex;flex-direction:column;gap:2px}.arrows button{font-size:10px;padding:0 5px;border-radius:4px}
@@ -1566,3 +1594,1570 @@
   }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',mount,{once:true});else mount();
 })();
+
+// BEGIN embedded Snail with Skins
+if (typeof window !== "undefined" && !(typeof module === "object" && module.exports)) {
+// Sprite discovery and atlas decoding adapted from the supplied Arie's Mod 4.0.3.
+// Standalone visual controls; does not send game commands or edit game data.
+(function () {
+'use strict';
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+  // src/platform/pageContext.ts
+  function shareGlobal(name, value) {
+    try {
+      pageWindow[name] = value;
+    } catch {
+    }
+    if (isSandboxed) {
+      try {
+        sandboxWindow[name] = value;
+      } catch {
+      }
+    }
+  }
+  function readSharedGlobal(name) {
+    if (isSandboxed) {
+      const sandboxValue = sandboxWindow[name];
+      if (sandboxValue !== void 0) return sandboxValue;
+    }
+    return pageWindow[name];
+  }
+  var sandboxWindow, pageWindow, isSandboxed;
+  var init_pageContext = __esm({
+    "src/platform/pageContext.ts"() {
+      "use strict";
+      sandboxWindow = window;
+      pageWindow = typeof unsafeWindow !== "undefined" && unsafeWindow ? unsafeWindow : sandboxWindow;
+      isSandboxed = pageWindow !== sandboxWindow;
+    }
+  });
+
+  // src/game/sprites/settings.ts
+  var DEFAULT_CFG, MUT_G1, MUT_G2, MUT_G3;
+  var init_settings = __esm({
+    "src/game/sprites/settings.ts"() {
+      "use strict";
+      DEFAULT_CFG = {
+        origin: "https://magicgarden.gg"
+      };
+      MUT_G1 = ["", "Gold", "Rainbow"].filter(Boolean);
+      MUT_G2 = ["", "Wet", "Chilled", "Frozen", "Thunderstruck", "Thundercharged"].filter(Boolean);
+      MUT_G3 = ["", "Dawnlit", "Ambershine", "Dawncharged", "Ambercharged"].filter(Boolean);
+    }
+  });
+
+  // src/game/sprites/state.ts
+  function createInitialState() {
+    return {
+      started: false,
+      loaded: false,
+      version: null,
+      base: null,
+      ctors: null,
+      app: null,
+      renderer: null,
+      tex: /* @__PURE__ */ new Map(),
+      atlasBases: /* @__PURE__ */ new Set()
+    };
+  }
+  function createSpriteContext() {
+    return {
+      cfg: { ...DEFAULT_CFG },
+      state: createInitialState()
+    };
+  }
+  var init_state = __esm({
+    "src/game/sprites/state.ts"() {
+      "use strict";
+      init_settings();
+    }
+  });
+
+  // src/game/sprites/context.ts
+  function setPixiHooks(hooks2) {
+    pixiHooks = hooks2;
+  }
+  function getSpriteState() {
+    return spriteContext.state;
+  }
+  function getReadySpriteState() {
+    const state5 = spriteContext.state;
+    return state5.renderer && state5.ctors?.Text ? state5 : null;
+  }
+  function getPixiApp() {
+    return pixiHooks?.app ?? spriteContext.state.app;
+  }
+  var spriteContext, pixiHooks;
+  var init_context = __esm({
+    "src/game/sprites/context.ts"() {
+      "use strict";
+      init_state();
+      spriteContext = createSpriteContext();
+      pixiHooks = null;
+    }
+  });
+
+  // src/game/sprites/utils/async.ts
+  async function waitWithTimeout(p, ms, label2) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < ms) {
+      const result = await Promise.race([p, sleep(50).then(() => null)]);
+      if (result !== null) return result;
+    }
+    throw new Error(`${label2} timeout`);
+  }
+  var sleep;
+  var init_async = __esm({
+    "src/game/sprites/utils/async.ts"() {
+      "use strict";
+      init_pageContext();
+      sleep = (ms) => new Promise((resolve) => pageWindow.setTimeout(resolve, ms));
+    }
+  });
+
+  // src/game/sprites/pixi/hooks.ts
+  function mkSyntheticApp(renderer) {
+    const stage = renderer?.lastObjectRendered ?? renderer?.stage ?? null;
+    return { renderer, stage };
+  }
+  function createPixiHooks() {
+    let appResolver;
+    let rdrResolver;
+    const appReady = new Promise((resolve) => appResolver = resolve);
+    const rendererReady = new Promise((resolve) => rdrResolver = resolve);
+    let APP = null;
+    let RDR = null;
+    let PIXI_VER = null;
+    const resolveApp = (a) => {
+      APP = a;
+      appResolver(a);
+    };
+    const resolveRdr = (r, v) => {
+      RDR = r;
+      if (v) PIXI_VER = v;
+      rdrResolver(r);
+      resolveApp(APP ?? mkSyntheticApp(r));
+    };
+    const hook = (name, cb) => {
+      const root4 = pageWindow;
+      const prev = root4[name];
+      root4[name] = function() {
+        try {
+          cb.apply(this, arguments);
+        } finally {
+          if (typeof prev === "function") {
+            try {
+              prev.apply(this, arguments);
+            } catch {
+            }
+          }
+        }
+      };
+    };
+    hook("__PIXI_APP_INIT__", (a, v) => {
+      if (v) PIXI_VER = v;
+      resolveApp(a);
+    });
+    hook("__PIXI_RENDERER_INIT__", (r, v) => resolveRdr(r, v));
+    const tryResolveExisting = () => {
+      const root4 = pageWindow;
+      const devtools = root4.__PIXI_DEVTOOLS__;
+      if (devtools?.renderers?.size > 0) {
+        const rdr = [...devtools.renderers][0];
+        if (rdr) resolveRdr(rdr);
+      }
+      if (!APP) {
+        const maybeApp = root4.__PIXI_APP__ || root4.PIXI_APP || root4.app;
+        if (maybeApp?.renderer) resolveApp(maybeApp);
+      }
+      if (!RDR) {
+        const maybeRdr = root4.__PIXI_RENDERER__ || root4.renderer || APP?.renderer;
+        if (maybeRdr) resolveRdr(maybeRdr);
+      }
+    };
+    tryResolveExisting();
+    const pageWin = pageWindow;
+    let fallbackPolls = 0;
+    const fallbackInterval = pageWin.setInterval(() => {
+      if (APP && RDR) {
+        pageWin.clearInterval(fallbackInterval);
+        return;
+      }
+      tryResolveExisting();
+      fallbackPolls += 1;
+      if (fallbackPolls >= 50) {
+        pageWin.clearInterval(fallbackInterval);
+      }
+    }, 100);
+    return {
+      get app() {
+        return APP;
+      },
+      get renderer() {
+        return RDR;
+      },
+      get pixiVersion() {
+        return PIXI_VER;
+      },
+      appReady,
+      rendererReady
+    };
+  }
+  async function waitForPixi(handles, timeoutMs = 15e3) {
+    const app = await waitWithTimeout(handles.appReady, timeoutMs, "PIXI app");
+    const renderer = await waitWithTimeout(handles.rendererReady, timeoutMs, "PIXI renderer");
+    return { app, renderer, version: handles.pixiVersion };
+  }
+  var init_hooks = __esm({
+    "src/game/sprites/pixi/hooks.ts"() {
+      "use strict";
+      init_async();
+      init_pageContext();
+    }
+  });
+
+  // src/game/sprites/utils/pixi.ts
+  function findAny(root4, pred, lim = 25e3) {
+    const stack = [root4];
+    const seen = /* @__PURE__ */ new Set();
+    let n = 0;
+    while (stack.length && n++ < lim) {
+      const node = stack.pop();
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      if (pred(node)) return node;
+      const children = node.children;
+      if (Array.isArray(children)) {
+        for (let i = children.length - 1; i >= 0; i -= 1) stack.push(children[i]);
+      }
+    }
+    return null;
+  }
+  function findAnyPerBranch(root4, pred, limPerBranch = 25e3) {
+    if (!root4) return null;
+    if (pred(root4)) return root4;
+    const children = root4.children;
+    if (!Array.isArray(children)) return null;
+    for (const child of children) {
+      const hit = findAny(child, pred, limPerBranch);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  function ctorsFromStage(stage) {
+    if (!stage) return null;
+    const anySpr = findAnyPerBranch(stage, (x) => x?.texture?.frame && x?.constructor && x?.texture?.constructor && x?.texture?.frame?.constructor);
+    if (!anySpr) return null;
+    const hasTextAndStyle = (x) => (typeof x?.text === "string" || typeof x?.text === "number") && x?.style;
+    const isRiveLikeNode = (x) => !!(x?.artboard || x?.stateMachine || x?.rive);
+    const anyTxt = findAnyPerBranch(stage, (x) => hasTextAndStyle(x) && x?.renderPipeId === "text") ?? findAnyPerBranch(stage, (x) => hasTextAndStyle(x) && !isRiveLikeNode(x));
+    // Skins do not require a text node.
+    return {
+      Container: stage.constructor,
+      Sprite: anySpr.constructor,
+      Texture: anySpr.texture.constructor,
+      Rectangle: anySpr.texture.frame.constructor,
+      Text: anyTxt?.constructor ?? null
+    };
+  }
+  function getCtors(app) {
+    const root4 = pageWindow;
+    const P = root4.PIXI;
+    if (P?.Texture && P?.Sprite && P?.Container && P?.Rectangle) {
+      return { Container: P.Container, Sprite: P.Sprite, Texture: P.Texture, Rectangle: P.Rectangle, Text: P.Text || null };
+    }
+    const renderer = app?.renderer ?? app;
+    for (const candidate of [app?.stage, renderer?.lastObjectRendered, renderer?.stage]) {
+      const hit = ctorsFromStage(candidate);
+      if (hit) return hit;
+    }
+    throw new Error("No Sprite found (ctors): PIXI not exposed and stage not yet rendered.");
+  }
+  function rememberBaseTex(tex, atlasBases) {
+    const base = baseTexOf(tex);
+    if (base) atlasBases.add(base);
+  }
+  var baseTexOf;
+  var init_pixi = __esm({
+    "src/game/sprites/utils/pixi.ts"() {
+      "use strict";
+      init_pageContext();
+      baseTexOf = (tex) => tex?.baseTexture ?? tex?.source?.baseTexture ?? tex?.source ?? tex?._baseTexture ?? null;
+    }
+  });
+
+  // src/game/sprites/pixi/resolvePixi.ts
+  async function resolvePixiFast(hooks2) {
+    const root4 = pageWindow;
+    const debugInfo = {
+      startedAt: Date.now(),
+      resolvedVia: null,
+      resolvedAt: null
+    };
+    root4.__SNAIL_SKINS_RESOLVE_PIXI_DEBUG__ = debugInfo;
+    const resolved = (via, bundle) => {
+      debugInfo.resolvedVia = via;
+      debugInfo.resolvedAt = Date.now();
+      return bundle;
+    };
+    const check = () => {
+      const app = root4.__PIXI_APP__ || root4.PIXI_APP || root4.app || null;
+      const renderer = root4.__PIXI_RENDERER__ || root4.PIXI_RENDERER__ || root4.renderer || app?.renderer || null;
+      return app && renderer ? { app, renderer, version: root4.__PIXI_VERSION__ || null } : null;
+    };
+    const hit = check();
+    if (hit) return resolved("fast-check-immediate", hit);
+    const start2 = performance.now();
+    while (performance.now() - start2 < 5e3) {
+      await sleep(50);
+      const retry = check();
+      if (retry) return resolved("fast-check-retry", retry);
+    }
+    const waited = await waitForPixi(hooks2);
+    return resolved("waitForPixi-fallback", { app: waited.app, renderer: waited.renderer, version: waited.version });
+  }
+  function inspectStage(root4) {
+    const stack = [root4];
+    const seen = /* @__PURE__ */ new Set();
+    let totalNodes = 0;
+    let spriteLikeCount = 0;
+    let textLikeCount = 0;
+    let n = 0;
+    while (stack.length && n++ < 25e3) {
+      const cur = stack.pop();
+      if (!cur || seen.has(cur)) continue;
+      seen.add(cur);
+      totalNodes++;
+      if (cur?.texture?.frame && cur?.constructor && cur?.texture?.constructor && cur?.texture?.frame?.constructor) spriteLikeCount++;
+      if ((typeof cur?.text === "string" || typeof cur?.text === "number") && cur?.style) textLikeCount++;
+      const children = cur.children;
+      if (Array.isArray(children)) {
+        for (let i = children.length - 1; i >= 0; i -= 1) stack.push(children[i]);
+      }
+    }
+    const topChildLabels = Array.isArray(root4?.children) ? root4.children.map((c) => c?.label || c?.constructor?.name || typeof c) : [];
+    return { totalNodes, spriteLikeCount, textLikeCount, topChildLabels };
+  }
+  async function waitForCtors(app, renderer) {
+    const attempts = [];
+    pageWindow.__SNAIL_SKINS_CTORS_DEBUG__ = attempts;
+    let iteration = 0;
+    const snapshot3 = () => {
+      const stage = app?.stage;
+      const lor = renderer?.lastObjectRendered;
+      const rStage = renderer?.stage;
+      const walkRoot = stage || lor || rStage || null;
+      attempts.push({
+        at: Date.now(),
+        hasAppStage: !!stage,
+        appStageChildren: Array.isArray(stage?.children) ? stage.children.length : -1,
+        hasLastObjectRendered: !!lor,
+        lastObjectRenderedChildren: Array.isArray(lor?.children) ? lor.children.length : -1,
+        hasRendererStage: !!rStage,
+        rendererStageChildren: Array.isArray(rStage?.children) ? rStage.children.length : -1,
+        documentHidden: typeof document !== "undefined" ? document.hidden : false,
+        visibilityState: typeof document !== "undefined" ? document.visibilityState : "unknown",
+        hasFocus: typeof document !== "undefined" ? document.hasFocus() : false,
+        // The deep walk is costly: about once a second, not every 100 ms.
+        inspect: walkRoot && iteration % 10 === 0 ? inspectStage(walkRoot) : null
+      });
+      iteration += 1;
+    };
+    const deadline = Date.now() + 1e4;
+    while (Date.now() < deadline) {
+      snapshot3();
+      try {
+        return getCtors(app);
+      } catch {
+      }
+      if (app && !app.stage && renderer?.lastObjectRendered) {
+        app.stage = renderer.lastObjectRendered;
+      }
+      await sleep(100);
+    }
+    snapshot3();
+    return getCtors(app);
+  }
+  var init_resolvePixi = __esm({
+    "src/game/sprites/pixi/resolvePixi.ts"() {
+      "use strict";
+      init_pageContext();
+      init_hooks();
+      init_pixi();
+      init_async();
+    }
+  });
+
+  // src/game/sprites/pixi/rendererHealth.ts
+  function canvasOf(renderer) {
+    return renderer?.canvas || renderer?.view?.canvas || renderer?.view || null;
+  }
+  function watchRendererHealth(state5, hooks2) {
+    const pageWin = pageWindow;
+    let staleStreak = 0;
+    let needsCtorsRederive = false;
+    const debugState3 = {
+      checks: 0,
+      staleStreak: 0,
+      swaps: [],
+      ctorsRederiveAttempts: 0,
+      lastCtorsRederiveError: null
+    };
+    pageWin.__SNAIL_SKINS_RENDERER_HEALTH_DEBUG__ = debugState3;
+    pageWin.setInterval(() => {
+      try {
+        debugState3.checks += 1;
+        if (needsCtorsRederive) {
+          debugState3.ctorsRederiveAttempts += 1;
+          try {
+            state5.ctors = getCtors(state5.app ?? state5.renderer);
+            needsCtorsRederive = false;
+            debugState3.lastCtorsRederiveError = null;
+            console.info("[Snail with Skins] re-derived ctors from the new renderer");
+          } catch (error) {
+            debugState3.lastCtorsRederiveError = String(error?.message ?? error);
+          }
+        }
+        const canvas = canvasOf(state5.renderer);
+        const canvasHealthy = !!canvas && typeof document !== "undefined" && document.contains(canvas);
+        if (canvasHealthy) {
+          staleStreak = 0;
+          debugState3.staleStreak = 0;
+          return;
+        }
+        staleStreak += 1;
+        debugState3.staleStreak = staleStreak;
+        if (staleStreak < REQUIRED_STALE_STREAK) return;
+        const freshRenderer = hooks2.renderer;
+        if (!freshRenderer || freshRenderer === state5.renderer) return;
+        const freshCanvas = canvasOf(freshRenderer);
+        if (!freshCanvas || typeof document === "undefined" || !document.contains(freshCanvas)) return;
+        console.info("[Snail with Skins] renderer canvas went stale, re-resolved a fresh one");
+        debugState3.swaps.push({ at: Date.now(), fromCanvasInDoc: canvasHealthy });
+        state5.renderer = freshRenderer;
+        if (hooks2.app) state5.app = hooks2.app;
+        needsCtorsRederive = true;
+        staleStreak = 0;
+        debugState3.staleStreak = 0;
+      } catch (error) {
+        console.warn("[Snail with Skins] renderer health check failed", error);
+      }
+    }, RENDERER_HEALTH_CHECK_MS);
+  }
+  var RENDERER_HEALTH_CHECK_MS, REQUIRED_STALE_STREAK;
+  var init_rendererHealth = __esm({
+    "src/game/sprites/pixi/rendererHealth.ts"() {
+      "use strict";
+      init_pageContext();
+      init_pixi();
+      RENDERER_HEALTH_CHECK_MS = 1e3;
+      REQUIRED_STALE_STREAK = 3;
+    }
+  });
+
+  // src/game/sprites/utils/path.ts
+  function normalizeSegments(path) {
+    const out = [];
+    for (const part2 of path.split("/")) {
+      if (part2 === "" || part2 === ".") continue;
+      if (part2 === "..") {
+        out.pop();
+        continue;
+      }
+      out.push(part2);
+    }
+    return out.join("/");
+  }
+  function animParse(key2) {
+    const parts = splitKey(key2);
+    const last = parts[parts.length - 1];
+    const match = last && last.match(/^(.*?)(?:[_-])(\d{1,6})(\.[a-z0-9]+)?$/i);
+    if (!match) return null;
+    const baseName = (match[1] || "") + (match[3] || "");
+    const idx = Number(match[2]);
+    if (!baseName || !Number.isFinite(idx)) return null;
+    return { baseKey: parts.slice(0, -1).concat(baseName).join("/"), idx, frameKey: key2 };
+  }
+  var splitKey, joinPath, dirOf, relPath;
+  var init_path = __esm({
+    "src/game/sprites/utils/path.ts"() {
+      "use strict";
+      splitKey = (key2) => String(key2 || "").split("/").filter(Boolean);
+      joinPath = (base, path) => base.replace(/\/?$/, "/") + String(path || "").replace(/^\//, "");
+      dirOf = (path) => path.lastIndexOf("/") >= 0 ? path.slice(0, path.lastIndexOf("/") + 1) : "";
+      relPath = (base, path) => typeof path === "string" ? normalizeSegments(path.startsWith("/") ? path.slice(1) : dirOf(base) + path) : path;
+    }
+  });
+
+  // src/platform/environment.ts
+  function isDiscordActivityContext() {
+    try {
+      return window.location.hostname.endsWith("discordsays.com");
+    } catch {
+      return false;
+    }
+  }
+  function isInIframe() {
+    try {
+      return window.top !== window.self;
+    } catch {
+      return true;
+    }
+  }
+  function hostOf(url) {
+    if (!url) return null;
+    try {
+      return new URL(url).hostname;
+    } catch {
+      return null;
+    }
+  }
+  function detectEnvironment() {
+    const framed = isInIframe();
+    const referrerHost = hostOf(document.referrer);
+    const embeddedInDiscord = framed && !!referrerHost && /(^|\.)discord(app)?\.com$/i.test(referrerHost);
+    return {
+      surface: isDiscordActivityContext() || embeddedInDiscord ? "discord" : "web",
+      host: location.hostname,
+      origin: location.origin,
+      isInIframe: framed,
+      platform: /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) ? "mobile" : "desktop"
+    };
+  }
+  function isDiscordSurface() {
+    return detectEnvironment().surface === "discord";
+  }
+  var init_environment = __esm({
+    "src/platform/environment.ts"() {
+      "use strict";
+    }
+  });
+
+  // src/platform/http.ts
+  function hasGm() {
+    return typeof GM_xmlhttpRequest === "function";
+  }
+  function gmRequest(req, kind) {
+    return new Promise((resolve, reject2) => {
+      if (!hasGm()) {
+        reject2(new Error("GM_xmlhttpRequest not available"));
+        return;
+      }
+      let deadline;
+      if (req.timeoutMs) {
+        deadline = setTimeout(
+          () => reject2(new Error(`Hard timeout for ${req.url}`)),
+          req.timeoutMs + HARD_DEADLINE_GRACE_MS
+        );
+      }
+      const settle = () => clearTimeout(deadline);
+      const details2 = {
+        method: req.method ?? "GET",
+        url: req.url,
+        onload: (res) => {
+          settle();
+          const body = kind === "text" ? res.responseText : res.response;
+          resolve({ status: res.status, ok: isOk(res.status), body: body ?? null });
+        },
+        onerror: () => {
+          settle();
+          reject2(new Error(`Network error for ${req.url}`));
+        },
+        ontimeout: () => {
+          settle();
+          reject2(new Error(`Timeout for ${req.url}`));
+        }
+      };
+      if (kind !== "text") details2.responseType = kind;
+      if (req.headers) details2.headers = req.headers;
+      if (req.body !== void 0) details2.data = req.body;
+      if (req.noCache) details2.nocache = true;
+      if (req.timeoutMs) details2.timeout = req.timeoutMs;
+      GM_xmlhttpRequest(details2);
+    });
+  }
+  async function fetchRequest(req, kind) {
+    const res = await fetch(req.url, {
+      method: req.method ?? "GET",
+      headers: req.headers,
+      body: req.body,
+      cache: req.noCache ? "no-store" : void 0
+    });
+    const body = kind === "blob" ? await res.blob() : kind === "arraybuffer" ? await res.arrayBuffer() : await res.text();
+    return { status: res.status, ok: res.ok, body };
+  }
+  async function request(req, kind) {
+    if (req.preferGm) {
+      if (hasGm()) {
+        try {
+          const res = await gmRequest(req, kind);
+          if (res.ok) return res;
+        } catch {
+        }
+      }
+      return fetchRequest(req, kind);
+    }
+    if (isDiscordActivityContext()) return gmRequest(req, kind);
+    try {
+      return await fetchRequest(req, kind);
+    } catch (error) {
+      if (!hasGm()) throw error;
+      return gmRequest(req, kind);
+    }
+  }
+  async function getOk(url, kind, options2) {
+    const res = await request({ ...options2, url }, kind);
+    if (!res.ok || res.body == null) throw new Error(`HTTP ${res.status} for ${url}`);
+    return res.body;
+  }
+  async function getJSON(url, options2) {
+    return JSON.parse(await getText(url, options2));
+  }
+  var HARD_DEADLINE_GRACE_MS, isOk, getText, getBlob;
+  var init_http = __esm({
+    "src/platform/http.ts"() {
+      "use strict";
+      init_environment();
+      HARD_DEADLINE_GRACE_MS = 2e3;
+      isOk = (status2) => status2 >= 200 && status2 < 300;
+      getText = (url, options2) => getOk(url, "text", options2);
+      getBlob = (url, options2) => getOk(url, "blob", options2);
+    }
+  });
+
+  // src/game/sprites/data/assetFetcher.ts
+  function blobToImage(blob) {
+    return new Promise((resolve, reject2) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.decoding = "async";
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(img);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject2(new Error("decode fail"));
+      };
+      img.src = url;
+    });
+  }
+  function isKtx2Path(path) {
+    return typeof path === "string" && path.toLowerCase().endsWith(".ktx2");
+  }
+  function matchesManagedTexture(bt, imgName) {
+    if (!bt) return false;
+    const needle = imgName.toLowerCase();
+    if (typeof bt.label === "string" && bt.label.toLowerCase().includes(needle)) return true;
+    if (typeof bt.cacheId === "string" && bt.cacheId.toLowerCase().includes(needle)) return true;
+    const resUrl = bt.resource?.url || bt.resource?.src || bt.source?.url || bt.source?.src || "";
+    if (typeof resUrl === "string" && resUrl.toLowerCase().includes(needle)) return true;
+    if (Array.isArray(bt.textureCacheIds)) {
+      for (const id of bt.textureCacheIds) {
+        if (typeof id === "string" && id.toLowerCase().includes(needle)) return true;
+      }
+    }
+    return false;
+  }
+  function getManagedTextures(renderer) {
+    const candidates = [
+      renderer?.textureGC?.managedTextures,
+      renderer?.texture?.managedTextures,
+      renderer?.texture?._managedTextures,
+      renderer?.textureSystem?.managedTextures
+    ];
+    for (const list of candidates) {
+      if (Array.isArray(list) && list.length) return list;
+    }
+    return [];
+  }
+  async function loadKtx2AsTexture(imgName, renderer, ctors, timeoutMs = 3e3) {
+    const root4 = pageWindow;
+    const PIXI = root4.PIXI;
+    if (PIXI?.Assets?.load) {
+      try {
+        return await PIXI.Assets.load({ src: imgName, loadParser: "loadTextures" });
+      } catch {
+      }
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const managed = getManagedTextures(renderer);
+      for (const bt of managed) {
+        if (matchesManagedTexture(bt, imgName)) {
+          if (ctors?.Texture && typeof bt.frame === "undefined" && typeof bt.width === "number") {
+            try {
+              return new ctors.Texture(bt);
+            } catch {
+            }
+          }
+          return bt;
+        }
+      }
+      await new Promise((r) => root4.setTimeout(r, 250));
+    }
+    if (ctors?.Texture?.from) {
+      for (const alias of [imgName, imgName.replace(/^.*\//, "")]) {
+        try {
+          const cached2 = ctors.Texture.from(alias);
+          if (cached2 && cached2 !== ctors.Texture.EMPTY) return cached2;
+        } catch {
+        }
+      }
+    }
+    throw new Error(`KTX2 base texture not found in renderer for "${imgName}"`);
+  }
+  function srcPath(entry) {
+    if (typeof entry === "string") return entry;
+    return typeof entry?.src === "string" && entry.src ? entry.src : null;
+  }
+  function srcResolution(entry) {
+    if (typeof entry === "string") return 1;
+    const value = Number(entry?.resolution);
+    return Number.isFinite(value) && value > 0 ? value : 1;
+  }
+  function isAtlasJsonPath(path) {
+    return path.endsWith(".json") && path !== "manifest.json" && !path.startsWith("audio/");
+  }
+  function extractAtlasJsons(manifest) {
+    const jsons = /* @__PURE__ */ new Set();
+    for (const bundle of manifest.bundles || []) {
+      for (const asset of bundle.assets || []) {
+        let best = null;
+        for (const entry of asset.src || []) {
+          const path = srcPath(entry);
+          if (!path || !isAtlasJsonPath(path)) continue;
+          const resolution = srcResolution(entry);
+          if (!best || resolution > best.resolution) best = { path, resolution };
+        }
+        if (best) jsons.add(best.path);
+      }
+    }
+    return jsons;
+  }
+  async function loadAtlasJsons(base, manifest) {
+    const jsons = extractAtlasJsons(manifest);
+    const seen = /* @__PURE__ */ new Set();
+    const data = {};
+    const loadOne = async (path) => {
+      if (seen.has(path)) return;
+      seen.add(path);
+      const json = await getJSON2(joinPath(base, path));
+      data[path] = json;
+      if (json?.meta?.related_multi_packs) {
+        for (const rel of json.meta.related_multi_packs) {
+          await loadOne(relPath(path, rel));
+        }
+      }
+    };
+    for (const p of jsons) {
+      await loadOne(p);
+    }
+    return data;
+  }
+  var ASSET_REQUEST, getJSON2, getBlob2;
+  var init_assetFetcher = __esm({
+    "src/game/sprites/data/assetFetcher.ts"() {
+      "use strict";
+      init_path();
+      init_http();
+      init_pageContext();
+      ASSET_REQUEST = { preferGm: true, timeoutMs: 5e3 };
+      getJSON2 = (url) => getJSON(url, ASSET_REQUEST);
+      getBlob2 = (url) => getBlob(url, ASSET_REQUEST);
+    }
+  });
+
+  // src/game/sprites/pixi/atlasToTextures.ts
+  function mkRect(Rectangle, x, y, w, h2) {
+    return new Rectangle(x, y, w, h2);
+  }
+  function mkSubTex(Texture, baseTex, frame, orig, trim, rotate, anchor) {
+    let t;
+    const src = baseTex?.source ?? baseTex?.baseTexture ?? baseTex;
+    try {
+      t = new Texture({ source: src, frame, orig, trim: trim || void 0, rotate: rotate || 0 });
+    } catch {
+      try {
+        t = new Texture(src, frame, orig, trim || void 0, rotate || 0);
+      } catch {
+        t = new Texture(baseTex, frame, orig, trim || void 0, rotate || 0);
+      }
+    }
+    try {
+      if (t && !t.label) t.label = frame?.width && frame?.height ? `sub:${frame.width}x${frame.height}` : "subtex";
+    } catch {
+    }
+    if (anchor) {
+      const target = t;
+      if (target.defaultAnchor?.set) {
+        try {
+          target.defaultAnchor.set(anchor.x, anchor.y);
+        } catch {
+        }
+      }
+      if (target.defaultAnchor && !target.defaultAnchor.set) {
+        target.defaultAnchor.x = anchor.x;
+        target.defaultAnchor.y = anchor.y;
+      }
+      if (!target.defaultAnchor) {
+        target.defaultAnchor = { x: anchor.x, y: anchor.y };
+      }
+    }
+    try {
+      t?.updateUvs?.();
+    } catch {
+    }
+    return t;
+  }
+  function buildAtlasTextures(data, baseTex, texMap, atlasBases, ctors) {
+    const { Texture, Rectangle } = ctors;
+    try {
+      if (baseTex && !baseTex.label) baseTex.label = data?.meta?.image || "atlasBase";
+    } catch {
+    }
+    rememberBaseTex(baseTex, atlasBases);
+    for (const [k, fd] of Object.entries(data.frames)) {
+      const fr = fd.frame;
+      const rot = fd.rotated ? 2 : 0;
+      const w = fd.rotated ? fr.h : fr.w;
+      const h2 = fd.rotated ? fr.w : fr.h;
+      const frame = mkRect(Rectangle, fr.x, fr.y, w, h2);
+      const ss = fd.sourceSize || { w: fr.w, h: fr.h };
+      const orig = mkRect(Rectangle, 0, 0, ss.w, ss.h);
+      let trim = null;
+      if (fd.trimmed && fd.spriteSourceSize) {
+        const s = fd.spriteSourceSize;
+        trim = mkRect(Rectangle, s.x, s.y, s.w, s.h);
+      }
+      const t = mkSubTex(Texture, baseTex, frame, orig, trim, rot, fd.anchor || null);
+      try {
+        t.label = k;
+      } catch {
+      }
+      rememberBaseTex(t, atlasBases);
+      texMap.set(k, t);
+    }
+  }
+  var isAtlas;
+  var init_atlasToTextures = __esm({
+    "src/game/sprites/pixi/atlasToTextures.ts"() {
+      "use strict";
+      init_pixi();
+      isAtlas = (j) => j && typeof j === "object" && j.frames && j.meta && typeof j.meta.image === "string";
+    }
+  });
+
+  // src/game/gameVersion.ts
+  function fromUrls(urls) {
+    for (const url of urls) {
+      const match = url && url.match(VERSION_IN_URL);
+      if (match?.[1]) return match[1];
+    }
+    return null;
+  }
+  function fromGlobals() {
+    const root4 = pageWindow;
+    const gv = root4.gameVersion || root4.MG_gameVersion || root4.__SNAIL_SKINS_GAME_VERSION__;
+    if (!gv) return null;
+    try {
+      if (typeof gv.getVersion === "function") return gv.getVersion() ? String(gv.getVersion()) : null;
+      if (typeof gv.get === "function") return gv.get() ? String(gv.get()) : null;
+      if (typeof gv === "string") return gv;
+    } catch {
+    }
+    return null;
+  }
+  function detectGameVersion(doc) {
+    if (gameVersion) return gameVersion;
+    const d = doc ?? (typeof document !== "undefined" ? document : null);
+    const scripts = d ? Array.from(d.scripts, (s) => s.src) : [];
+    const links = d ? Array.from(d.querySelectorAll("link[href]"), (l) => l.href) : [];
+    const found = fromUrls(scripts) ?? fromGlobals() ?? fromUrls(links);
+    if (found) gameVersion = found;
+    return found;
+  }
+  var gameVersion, VERSION_IN_URL;
+  var init_gameVersion = __esm({
+    "src/game/gameVersion.ts"() {
+      "use strict";
+      init_pageContext();
+      gameVersion = null;
+      VERSION_IN_URL = /\/(?:r\/\d+\/)?version\/([^/]+)/;
+    }
+  });
+
+  // src/game/sprites/index.ts
+  function whenAtlasBundleReady() {
+    return atlasBundleReady;
+  }
+  function getAtlasBundle() {
+    return atlasBundle;
+  }
+  async function waitForGameVersion(timeoutMs = 12e3) {
+    const deadline = Date.now() + timeoutMs;
+    for (; ; ) {
+      const version = detectGameVersion();
+      if (version) return version;
+      if (Date.now() >= deadline) throw new Error("Game version not found.");
+      await sleep(120);
+    }
+  }
+  async function prefetchAtlas(base) {
+    try {
+      const manifest = await getJSON2(joinPath(base, "manifest.json"));
+      const atlasJsons = await loadAtlasJsons(base, manifest);
+      const blobs = /* @__PURE__ */ new Map();
+      for (const [path, data] of Object.entries(atlasJsons)) {
+        if (!isAtlas(data) || !Object.keys(data.frames).some(key => categoryFor(key))) continue;
+        const imgPath = relPath(path, data.meta.image);
+        if (isKtx2Path(imgPath)) continue;
+        try {
+          blobs.set(imgPath, await getBlob2(joinPath(base, imgPath)));
+        } catch {
+        }
+      }
+      return { base, atlasJsons, blobs };
+    } catch {
+      return null;
+    }
+  }
+  async function loadTextures(base, prefetched) {
+    const usePrefetched = prefetched && prefetched.base === base ? prefetched : null;
+    const atlasJsons = usePrefetched?.atlasJsons ?? await loadAtlasJsons(base, await getJSON2(joinPath(base, "manifest.json")));
+    atlasBundle = usePrefetched ?? { base, atlasJsons, blobs: /* @__PURE__ */ new Map() };
+    atlasBundleResolve?.(atlasBundle);
+    atlasBundleResolve = null;
+    const ctors = ctx.state.ctors;
+    if (!ctors?.Texture || !ctors?.Rectangle) throw new Error("PIXI constructors missing");
+    for (const [path, data] of Object.entries(atlasJsons)) {
+      if (!isAtlas(data) || !Object.keys(data.frames).some(key => categoryFor(key))) continue;
+      if (SKIPPED_ATLAS_PATTERNS.some((re) => re.test(path))) continue;
+      const imgPath = relPath(path, data.meta.image);
+      try {
+        let baseTex;
+        if (isKtx2Path(imgPath)) {
+          baseTex = await loadKtx2AsTexture(imgPath, ctx.state.renderer, ctors);
+        } else {
+          const blob = usePrefetched?.blobs.get(imgPath) ?? await getBlob2(joinPath(base, imgPath));
+          baseTex = ctors.Texture.from(await blobToImage(blob));
+        }
+        buildAtlasTextures(data, baseTex, ctx.state.tex, ctx.state.atlasBases, {
+          Texture: ctors.Texture,
+          Rectangle: ctors.Rectangle
+        });
+      } catch (error) {
+        console.warn("[Snail with Skins] skipping atlas (texture load failed)", { path, imgPath, error });
+      }
+    }
+    ctx.state.loaded = true;
+  }
+  function ensureDocumentReady() {
+    if (document.readyState !== "loading") return Promise.resolve();
+    return new Promise((resolve) => {
+      document.addEventListener("DOMContentLoaded", () => resolve(), { once: true });
+    });
+  }
+  async function start() {
+    if (ctx.state.started) return;
+    ctx.state.started = true;
+    let version;
+    try {
+      version = await waitForGameVersion();
+      console.info("[Snail with Skins] game version resolved", version);
+    } catch (err) {
+      console.error("[Snail with Skins] failed to resolve game version", err);
+      throw err;
+    }
+    const base = `${ctx.cfg.origin.replace(/\/$/, "")}/version/${version}/assets/`;
+    if (!prefetchPromise) prefetchPromise = prefetchAtlas(base);
+    const { app, renderer: resolvedRenderer, version: pixiVersion } = await resolvePixiFast(hooks);
+    await ensureDocumentReady();
+    const renderer = resolvedRenderer || app?.renderer || app?.render || null;
+    ctx.state.ctors = await waitForCtors(app, renderer);
+    ctx.state.app = app;
+    ctx.state.renderer = renderer;
+    ctx.state.version = pixiVersion ?? version;
+    ctx.state.base = base;
+    watchRendererHealth(ctx.state, hooks);
+    pageWindow.__SNAIL_SKINS_SPRITE_STATE__ = ctx.state;
+    await loadTextures(ctx.state.base, await prefetchPromise);
+    console.log("[Snail with Skins] ready", {
+      version: ctx.state.version,
+      pixi: version,
+      textures: ctx.state.tex.size
+    });
+  }
+  async function startWithRetry() {
+    const RETRY_DELAY_MS = 2e3;
+    for (; ; ) {
+      try {
+        await start();
+        return;
+      } catch (err) {
+        console.error("[Snail with Skins] failed, retrying", err);
+        ctx.state.started = false;
+        await sleep(RETRY_DELAY_MS);
+      }
+    }
+  }
+  var ctx, hooks, prefetchPromise, atlasBundle, atlasBundleResolve, atlasBundleReady, SKIPPED_ATLAS_PATTERNS;
+  var init_sprites = __esm({
+    "src/game/sprites/index.ts"() {
+      "use strict";
+      init_pageContext();
+      init_context();
+      init_hooks();
+      init_resolvePixi();
+      init_rendererHealth();
+      init_async();
+      init_assetFetcher();
+      init_atlasToTextures();
+      init_path();
+      init_gameVersion();
+      ctx = spriteContext;
+      hooks = createPixiHooks();
+      setPixiHooks(hooks);
+      prefetchPromise = null;
+      atlasBundle = null;
+      atlasBundleResolve = null;
+      atlasBundleReady = new Promise((resolve) => {
+        atlasBundleResolve = resolve;
+      });
+      SKIPPED_ATLAS_PATTERNS = [/(^|\/)weather(-\d+x)?\.json$/i];
+      void startWithRetry();
+    }
+  });
+
+
+const APP_NAME = 'Snail with Skins';
+const CONFIG_KEY = 'snail-with-skins.v1';
+const DEFAULT_RULE = Object.freeze({ hidden:false, opacity:1, scale:1, imageId:null });
+const CATEGORIES = ['plant', 'mutation', 'mutation-overlay'];
+const ownKey = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
+const copy = value => JSON.parse(JSON.stringify(value));
+function categoryFor(key) {
+  const parts = String(key).split('/').filter(Boolean);
+  if (['sprite','sprites'].includes(parts[0])) parts.shift();
+  if (['plant','tall-plant','crop'].includes(parts[0])) return 'plant';
+  return ['mutation','mutation-overlay'].includes(parts[0]) ? parts[0] : null;
+}
+function objectFor(key) {
+  return String(key).replace(/[_-]\d{1,6}(?=(?:\.[a-z0-9]+)?$)/i, '');
+}
+function newConfig() { return { version:1, enabled:true, groups:{}, objects:{}, frames:{} }; }
+function validRule(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw Error('잘못된 스킨 설정입니다.');
+  const rule = {};
+  if (ownKey(raw,'hidden')) {
+    if (typeof raw.hidden !== 'boolean') throw Error('숨기기 값이 잘못되었습니다.');
+    rule.hidden = raw.hidden;
+  }
+  for (const [key,min,max] of [['opacity',0,1],['scale',0.1,3]]) {
+    if (!ownKey(raw,key)) continue;
+    if (typeof raw[key] !== 'number' || !Number.isFinite(raw[key]) || raw[key]<min || raw[key]>max) throw Error('투명도 또는 크기 범위를 확인하세요.');
+    rule[key] = raw[key];
+  }
+  if (ownKey(raw,'imageId')) {
+    if (raw.imageId !== null && (typeof raw.imageId !== 'string' || !/^img-[a-z0-9-]+$/i.test(raw.imageId))) throw Error('이미지 정보가 잘못되었습니다.');
+    rule.imageId = raw.imageId;
+  }
+  return rule;
+}
+function readConfig(raw) {
+  const out = newConfig();
+  if (!raw || raw.version !== 1 || typeof raw.enabled !== 'boolean') throw Error('지원하지 않는 설정입니다.');
+  out.enabled = raw.enabled;
+  for (const scope of ['groups','objects','frames']) {
+    if (!raw[scope] || typeof raw[scope] !== 'object' || Array.isArray(raw[scope])) throw Error('설정 목록이 잘못되었습니다.');
+    for (const [key,value] of Object.entries(raw[scope])) {
+      if (scope === 'groups' ? !CATEGORIES.includes(key) : !categoryFor(key)) continue;
+      Object.defineProperty(out[scope], key, { value:validRule(value), enumerable:true, configurable:true, writable:true });
+    }
+  }
+  return out;
+}
+function resolveRule(config, frameKey) {
+  const category = categoryFor(frameKey);
+  if (!category || !config.enabled) return { ...DEFAULT_RULE };
+  return { ...DEFAULT_RULE, ...config.groups[category], ...config.objects[objectFor(frameKey)], ...config.frames[frameKey] };
+}
+function isEdited(rule) { return rule.hidden || rule.opacity !== 1 || rule.scale !== 1 || !!rule.imageId; }
+function rectOf(texture) { return texture?.frame ?? texture?._frame; }
+function sourceOfTexture(texture) { return texture?.source ?? texture?._source ?? texture?.baseTexture; }
+function rectSignature(rect) { return rect && [rect.x,rect.y,rect.width,rect.height].join('|'); }
+function atlasName(value) { return String(value || '').split(/[?#]/)[0].split('/').pop().replace(/\.(?:png|webp|ktx2|jpg)$/i,'').toLowerCase(); }
+function atlasHints(source) {
+  return [source?.label,source?.cacheId,source?.resource?.url,source?.resource?.src,source?.resource?._url,source?.resource?.source?.src,source?.resource?.src,source?.source?.src,...(source?.textureCacheIds || [])].map(atlasName).filter(Boolean);
+}
+function assignTextureSource(texture, source) {
+  try { texture.source = source; } catch (_) {}
+  if (sourceOfTexture(texture) === source) return true;
+  for (const field of ['_source','baseTexture','_baseTexture']) {
+    try { texture[field] = source; } catch (_) {}
+    if (sourceOfTexture(texture) === source) return true;
+  }
+  return false;
+}
+function updateTexture(texture) {
+  texture.updateUvs?.();
+  texture.update?.();
+  texture.emit?.('update', texture);
+}
+function patchTexture(texture, source, canvas, scale) {
+  const frame = rectOf(texture);
+  if (!frame || !source) return null;
+  const snapshot = { texture, source:sourceOfTexture(texture), frame:{...frame}, orig:texture.orig && {...texture.orig}, trim:texture.trim && {...texture.trim}, rotate:texture.rotate, dynamic:texture.dynamic };
+  if (!assignTextureSource(texture,source)) throw Error('게임 텍스처를 변경할 수 없습니다.');
+  try {
+    frame.x=0; frame.y=0; frame.width=canvas.width; frame.height=canvas.height;
+    // Scale the logical bounds as well, so enlarging does not crop the image.
+    if (texture.orig) {
+      texture.orig.width = snapshot.orig.width * scale;
+      texture.orig.height = snapshot.orig.height * scale;
+    }
+    if (texture.trim) {
+      texture.trim.x = snapshot.trim.x * scale; texture.trim.y = snapshot.trim.y * scale;
+      texture.trim.width=canvas.width; texture.trim.height=canvas.height;
+    }
+    texture.rotate=0;
+    texture.dynamic=true;
+    updateTexture(texture);
+    return snapshot;
+  } catch (error) { restoreTexture(snapshot); throw error; }
+}
+function restoreTexture(snapshot) {
+  const {texture,source,frame,orig,trim,rotate,dynamic} = snapshot;
+  if (texture.destroyed) return;
+  if (!assignTextureSource(texture,source)) throw Error('원본 텍스처 복구에 실패했습니다.');
+  Object.assign(rectOf(texture),frame);
+  if (orig && texture.orig) Object.assign(texture.orig,orig);
+  if (trim && texture.trim) Object.assign(texture.trim,trim);
+  texture.rotate=rotate;
+  updateTexture(texture);
+  texture.dynamic=dynamic;
+}
+function targetsFrom(bundle) {
+  const targets = new Map();
+  for (const [path,data] of Object.entries(bundle.atlasJsons)) {
+    for (const [key,fd] of Object.entries(data?.frames || {})) {
+      if (!categoryFor(key) || !(fd.frame?.w>0 && fd.frame?.h>0)) continue;
+      const fr=fd.frame;
+      targets.set(key,{key,object:objectFor(key),category:categoryFor(key),atlas:atlasName(relPath(path,data.meta.image)),width:fr.w,height:fr.h,rect:{x:fr.x,y:fr.y,width:fd.rotated?fr.h:fr.w,height:fd.rotated?fr.w:fr.h}});
+    }
+  }
+  return targets;
+}
+function createMatcher(targets, cachedTextures, snapshots = new Map()) {
+  const identities=new Map(), byRect=new Map(), sourceAtlases=new Map();
+  for (const target of targets.values()) {
+    const texture=cachedTextures.get(target.key);
+    if (texture) {
+      identities.set(texture,target);
+      const source=snapshots.get(texture)?.source ?? sourceOfTexture(texture);
+      if (source) {
+        if (!sourceAtlases.has(source)) sourceAtlases.set(source,new Set());
+        sourceAtlases.get(source).add(target.atlas);
+      }
+    }
+    const sig=rectSignature(target.rect);
+    if (!byRect.has(sig)) byRect.set(sig,[]);
+    byRect.get(sig).push(target);
+  }
+  return texture => {
+    if (identities.has(texture)) return identities.get(texture);
+    const label=texture?.label;
+    if (targets.has(label)) return targets.get(label);
+    const original=snapshots.get(texture);
+    const source=original?.source ?? sourceOfTexture(texture);
+    const names=new Set([...(sourceAtlases.get(source) || []),...atlasHints(source)]);
+    const matches=(byRect.get(rectSignature(original?.frame ?? rectOf(texture))) || []).filter(t=>names.has(t.atlas));
+    // Never guess from rectangle alone: pets/decor may use the same coordinates.
+    return matches.length===1 ? matches[0] : null;
+  };
+}
+function composeCanvas(target, image, rule) {
+  const canvas=document.createElement('canvas');
+  canvas.width=Math.max(1,Math.round(target.width*rule.scale));
+  canvas.height=Math.max(1,Math.round(target.height*rule.scale));
+  if (canvas.width*canvas.height>16*1024*1024) throw Error('이미지가 너무 큽니다. 크기를 줄여 주세요.');
+  const ctx=canvas.getContext('2d');
+  if (!ctx) throw Error('이미지 그리기를 사용할 수 없습니다.');
+  if (rule.hidden || rule.opacity===0) return canvas;
+  if (!image) throw Error('원본 이미지를 읽지 못했습니다. 다시 연결해 주세요.');
+  const fit=Math.min(canvas.width/image.width,canvas.height/image.height);
+  const w=image.width*fit,h=image.height*fit;
+  ctx.imageSmoothingEnabled=fit<1;
+  ctx.globalAlpha=rule.opacity;
+  ctx.drawImage(image,(canvas.width-w)/2,(canvas.height-h)/2,w,h);
+  return canvas;
+}
+
+// Keep pure configuration and texture operations directly testable in Node.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports={newConfig,readConfig,resolveRule,categoryFor,objectFor,createMatcher,patchTexture,restoreTexture,composeCanvas};
+} else {
+  void bootSkins();
+}
+
+async function bootSkins() {
+  const root=typeof unsafeWindow!=='undefined' && unsafeWindow ? unsafeWindow : window;
+  if (root.__SNAIL_WITH_SKINS__) return;
+  const api={version:'1.0.0'};
+  root.__SNAIL_WITH_SKINS__=api;
+  let config=newConfig(), targets=new Map(), selectedCategory='plant', selectedObject='', query='';
+  let database, ui, lastRenderer, revision=0, work=Promise.resolve(), applying=false;
+  let assets=new Map(), snapshots=new Map(), generated=new Map(), originals=new Map(), appliedNodes=new Set();
+  let status='게임과 이미지 목록을 기다리는 중…', error='', cacheNotice='';
+  try { const stored=localStorage.getItem(CONFIG_KEY); if (stored) config=readConfig(JSON.parse(stored)); }
+  catch (e) { error=`저장된 설정을 불러오지 못했습니다: ${e.message}`; }
+  init_sprites();
+  // Frames can be decoded before the sprite bridge finishes its atlas pass.
+  api.ready=false;
+  api.getConfig=()=>copy(config);
+  api.setEnabled=on=>{config.enabled=!!on;change();render();return work;};
+  api.refresh=()=>queueApply();
+  let panelOpen=false,publishedEnabled=config.enabled;
+  api.setPanelOpen=on=>{panelOpen=!!on;if(ui){ui.panel.hidden=!panelOpen;if(panelOpen)render();}};
+  root.dispatchEvent(new Event('snail-with-skins:config-change'));
+  function save() {
+    try { localStorage.setItem(CONFIG_KEY,JSON.stringify(config)); }
+    catch (e) { throw Error(`설정을 저장하지 못했습니다: ${e.message}`); }
+  }
+  function change() {
+    if(publishedEnabled!==config.enabled){publishedEnabled=config.enabled;root.dispatchEvent(new Event('snail-with-skins:config-change'));}
+    revision++;
+    try { save(); } catch (e) { report(e); }
+    queueApply();
+  }
+  function report(e) { error=e.message || String(e); renderStatus(); console.warn(`[${APP_NAME}]`,e); }
+  function queueApply() {
+    const version=revision;
+    work=work.then(()=>applyAll(version)).catch(report);
+    return work;
+  }
+  async function openImages() {
+    database=await new Promise((resolve,reject)=>{
+      const request=indexedDB.open('snail-with-skins',1);
+      request.onupgradeneeded=()=>request.result.createObjectStore('images',{keyPath:'id'});
+      request.onsuccess=()=>resolve(request.result);
+      request.onerror=()=>reject(request.error);
+      request.onblocked=()=>reject(Error('다른 게임 탭을 닫고 다시 시도해 주세요.'));
+    });
+    return imageTransaction('readonly',store=>store.getAll());
+  }
+  function imageTransaction(mode,action) {
+    if (!database) return Promise.reject(Error('이미지 저장소가 준비되지 않았습니다. 다시 연결해 주세요.'));
+    return new Promise((resolve,reject)=>{
+      const tx=database.transaction('images',mode), req=action(tx.objectStore('images'));
+      tx.oncomplete=()=>resolve(req.result);
+      tx.onabort=tx.onerror=()=>reject(tx.error || req.error || Error('이미지를 저장하지 못했습니다.'));
+    });
+  }
+  async function upload(scope,key,file) {
+    if (!file) return;
+    if (file.size>4*1024*1024) throw Error('이미지는 4MB 이하로 선택해 주세요.');
+    const bitmap=await createImageBitmap(file);
+    if (bitmap.width*bitmap.height>16*1024*1024) { bitmap.close?.(); throw Error('이미지 해상도가 너무 큽니다.'); }
+    const id=`img-${crypto.randomUUID()}`;
+    try { await imageTransaction('readwrite',store=>store.put({id,blob:file})); }
+    catch (e) { bitmap.close?.(); throw e; }
+    assets.set(id,bitmap);
+    config[scope][key]={...config[scope][key],imageId:id};
+    change(); render();
+    // Images no longer referenced by any setting are reclaimed after a successful save.
+    const used=new Set(['groups','objects','frames'].flatMap(s=>Object.values(config[s]).map(r=>r.imageId)).filter(Boolean));
+    for (const [old,image] of assets) if (!used.has(old)) {
+      await imageTransaction('readwrite',store=>store.delete(old)); image.close?.(); assets.delete(old);
+    }
+  }
+  function cacheTexture(key) {
+    const Texture=getSpriteState().ctors?.Texture;
+    try { const t=Texture?.from(key); if (t && t!==Texture.EMPTY && rectOf(t)) return t; } catch (_) {}
+    for (const cache of [root.PIXI?.Assets,root.PIXI?.Cache]) {
+      try { const t=cache?.get?.(key); if (t && rectOf(t)) return t; } catch (_) {}
+    }
+    return null;
+  }
+  function walkSprites() {
+    const state=getSpriteState(), nodes=[], seen=new Set();
+    const stack=[state.app?.stage,state.renderer?.lastObjectRendered,state.renderer?.stage];
+    while (stack.length && seen.size<40000) {
+      const node=stack.pop();
+      if (!node || seen.has(node) || node.destroyed) continue;
+      seen.add(node);
+      if (node.texture && rectOf(node.texture)) nodes.push(node);
+      if (Array.isArray(node.children)) for (const child of node.children) stack.push(child);
+    }
+    return nodes;
+  }
+  function poke(node) {
+    if (!node || node.destroyed) return;
+    try {
+      const t=node.texture, empty=getSpriteState().ctors?.Texture?.EMPTY;
+      if (empty && t && t!==empty) {node.texture=empty;node.texture=t;}
+      else node.onViewUpdate?.();
+    } catch (_) {}
+  }
+  function rebake() {
+    const state=getSpriteState();
+    const queue=[getPixiApp(),state.app,state.renderer,root.__PIXI_APP__,root.app];
+    const seen=new Set();
+    while (queue.length && seen.size<400) {
+      const holder=queue.shift();
+      if (!holder || typeof holder!=='object' || seen.has(holder)) continue;
+      seen.add(holder);
+      if (typeof holder.renderTextureCache?.rebakeAll==='function') {
+        holder.renderTextureCache.rebakeAll(); cacheNotice=''; return true;
+      }
+      for (const key of ['app','engine','game','renderer','stage','_app','quinoa']) if (holder[key]) queue.push(holder[key]);
+    }
+    cacheNotice='변이 합성 캐시를 찾지 못했습니다. 이미 합성된 변이 식물은 변경이 늦게 보일 수 있습니다.';
+    return false;
+  }
+  function restoreAll() {
+    const failed=[];
+    for (const [texture,snapshot] of snapshots) {
+      try { restoreTexture(snapshot);snapshots.delete(texture); } catch (e) {failed.push(e);}
+    }
+    for (const node of appliedNodes) poke(node);
+    appliedNodes.clear();
+    if (failed.length) throw failed[0];
+    // GPU sources may only be released after all users of them are restored.
+    for (const entry of generated.values()) entry.texture.destroy?.(true);
+    generated.clear();
+  }
+  async function originalImage(target) {
+    if (originals.has(target.key)) return originals.get(target.key);
+    const state=getSpriteState(), texture=state.tex.get(target.key);
+    if (!texture || !state.renderer?.extract) return null;
+    const sprite=new state.ctors.Sprite(texture);
+    try {
+      const extracted=await state.renderer.extract.canvas(sprite,{resolution:1});
+      // Extract can return a pooled canvas; keep an independent copy.
+      const canvas=document.createElement('canvas');canvas.width=extracted.width;canvas.height=extracted.height;
+      canvas.getContext('2d').drawImage(extracted,0,0);
+      originals.set(target.key,canvas);return canvas;
+    } finally {sprite.destroy?.({texture:false,baseTexture:false});}
+  }
+  async function applyAll(version) {
+    if (!api.ready || version!==revision) return;
+    applying=true; error='';renderStatus();
+    try {
+      restoreAll();
+      if (!config.enabled) {rebake();status='전체 적용 OFF · 원래 모습으로 표시합니다.';return;}
+      const state=getSpriteState();
+      for (const target of targets.values()) {
+        const rule=resolveRule(config,target.key);
+        if (!isEdited(rule)) continue;
+        const image=rule.imageId ? assets.get(rule.imageId) : rule.hidden || rule.opacity===0 ? null : await originalImage(target);
+        if (version!==revision) return;
+        if (rule.imageId && !image && !rule.hidden && rule.opacity!==0) throw Error('저장된 스킨 이미지를 읽지 못했습니다. 이미지를 다시 선택해 주세요.');
+        const canvas=composeCanvas(target,image,rule);
+        const texture=state.ctors.Texture.from(canvas);
+        generated.set(target.key,{texture,canvas,rule});
+      }
+      if (version!==revision) return;
+      applyDiscovered();
+      if (!generated.size) status='전체 적용 ON · 기본 게임 이미지로 표시합니다.';
+    } finally { applying=false;renderStatus(); }
+  }
+  function applyDiscovered() {
+    if (!config.enabled || !generated.size) return;
+    const cached=new Map();
+    for (const key of targets.keys()) {const texture=cacheTexture(key);if (texture) cached.set(key,texture);}
+    const match=createMatcher(targets,cached,snapshots);
+    const nodes=walkSprites();
+    const candidates=new Set([...cached.values(),...nodes.map(n=>n.texture)]);
+    const catalog=new Set(getSpriteState().tex.values());
+    let changed=false;
+    for (const texture of candidates) {
+      if (snapshots.has(texture) || catalog.has(texture) || texture.destroyed) continue;
+      const target=match(texture), entry=target && generated.get(target.key);
+      if (!entry) continue;
+      const snapshot=patchTexture(texture,sourceOfTexture(entry.texture),entry.canvas,entry.rule.scale);
+      if (snapshot) {snapshots.set(texture,snapshot);changed=true;}
+    }
+    for (const node of nodes) if (snapshots.has(node.texture)) {if (!appliedNodes.has(node)) poke(node);appliedNodes.add(node);}
+    for (const node of appliedNodes) if (node.destroyed || !node.parent) appliedNodes.delete(node);
+    for (const texture of snapshots.keys()) if (texture.destroyed) snapshots.delete(texture);
+    if (changed) rebake();
+    api.appliedTextures=snapshots.size;
+    status=generated.size && !snapshots.size
+      ? `전체 적용 ON · ${generated.size}개 프레임 준비됨 · 게임에 표시될 때 적용합니다.`
+      : `전체 적용 ON · ${generated.size}개 프레임 설정 · ${snapshots.size}개 텍스처에 적용`;
+    renderStatus();
+  }
+  async function connect() {
+    try {
+      status='게임 이미지 목록을 불러오는 중…';renderStatus();
+      const bundle=await whenAtlasBundleReady();
+      // Atlas metadata is published before its textures finish loading.
+      while (!getSpriteState().loaded) await new Promise(r=>setTimeout(r,150));
+      targets=targetsFrom(bundle);
+      if (!targets.size) throw Error('지원하는 Plant / Mutation 이미지를 찾지 못했습니다.');
+      api.ready=true;api.targetCount=targets.size;lastRenderer=getSpriteState().renderer;
+      render();await queueApply();
+    } catch(e) {report(e);}
+  }
+  await new Promise(resolve=>{if (document.body) resolve();else document.addEventListener('DOMContentLoaded',resolve,{once:true});});
+  mountUI();
+  try {
+    const rows=await openImages();
+    for (const row of rows) {
+      try {assets.set(row.id,await createImageBitmap(row.blob));} catch (_) {error='일부 저장된 이미지를 읽지 못했습니다. 다시 선택해 주세요.';}
+    }
+  } catch(e) {report(e);}
+  void connect();
+  setInterval(()=>{
+    if (!api.ready || applying) return;
+    const current=getSpriteState().renderer;
+    if (current && current!==lastRenderer) {
+      lastRenderer=current;originals.clear();revision++;queueApply();
+    } else {
+      try {applyDiscovered();} catch(e) {report(e);}
+    }
+  },1500);
+
+  function element(tag,text,className) {
+    const el=document.createElement(tag);if (text!==undefined) el.textContent=text;if (className) el.className=className;return el;
+  }
+  function button(text,fn,className) {
+    const el=element('button',text,className);el.type='button';
+    el.onclick=()=>Promise.resolve().then(fn).catch(report);return el;
+  }
+  function mountUI() {
+    const host=element('div');host.id='snail-with-skins';document.body.append(host);
+    const shadow=host.attachShadow({mode:'open'});
+    const style=element('style');style.textContent=SKINS_CSS;shadow.append(style);
+
+    const panel=element('section',undefined,'panel');panel.hidden=!panelOpen;panel.setAttribute('aria-label',APP_NAME);
+    const header=element('header');header.append(element('strong',APP_NAME),button('닫기',()=>api.setPanelOpen(false)));
+    const toggle=button('',()=>api.setEnabled(!config.enabled),'master');toggle.setAttribute('role','switch');
+    const tabs=element('nav');
+    for (const c of CATEGORIES) tabs.append(button(c==='plant'?'Plant':c==='mutation'?'Mutation':'Mutation-overlay',()=>{selectedCategory=c;selectedObject='';render();}));
+    const help=element('p','개별 프레임 > 개별 식물/변이 > 전체 설정 · 투명도 100%는 완전 투명','hint');
+    const global=element('div',undefined,'global'), search=element('input');search.type='search';search.placeholder='이름 검색';search.setAttribute('aria-label','이름 검색');
+    search.oninput=()=>{query=search.value;renderList();};
+    const list=element('div',undefined,'list'), detail=element('div',undefined,'detail');
+    const browser=element('div',undefined,'browser');browser.append(search,list);
+    const panes=element('div',undefined,'panes');panes.append(browser,detail);
+    const statusEl=element('div',undefined,'status');statusEl.setAttribute('role','status');statusEl.setAttribute('aria-live','polite');
+    const footer=element('footer');footer.append(button('다시 적용',()=>{revision++;queueApply();}),button('전체 설정 초기화',()=>{
+      if (!window.confirm('전체 스킨 설정을 초기화할까요?')) return;
+      config=newConfig();change();render();
+    }));
+    panel.append(header,toggle,tabs,help,global,panes,statusEl,footer);shadow.append(panel);
+    ui={host,shadow,panel,toggle,tabs,global,list,detail,statusEl};render();
+    shadow.addEventListener('keydown',event=>{if (event.key==='Escape') {api.setPanelOpen(false);document.querySelector('#snail-in-cherry')?.shadowRoot?.querySelector('.menu-link')?.focus();}});
+  }
+  function renderStatus() {
+    if (!ui) return;
+    ui.statusEl.textContent=[error,applying?'변경 사항을 적용하는 중…':status,cacheNotice].filter(Boolean).join('\n');
+    ui.statusEl.classList.toggle('error',!!error);
+    ui.toggle.textContent=`전체 적용 ${config.enabled?'ON':'OFF'}`;
+    ui.toggle.setAttribute('aria-checked',String(config.enabled));
+    ui.toggle.classList.toggle('on',config.enabled);
+
+  }
+  function groups() {
+    const result=new Map();
+    for (const t of targets.values()) if (t.category===selectedCategory) {
+      if (!result.has(t.object)) result.set(t.object,[]);result.get(t.object).push(t);
+    }
+    return [...result].sort((a,b)=>a[0].localeCompare(b[0],undefined,{numeric:true}));
+  }
+  function name(key) {return key.split('/').pop();}
+  function renderList() {
+    ui.list.replaceChildren();
+    const filtered=groups().filter(([key])=>key.toLowerCase().includes(query.toLowerCase()));
+    if (!filtered.length) ui.list.append(element('p',api.ready?'검색 결과가 없습니다.':'게임 이미지 대기 중…','hint'));
+    for (const [key,slots] of filtered) {
+      const custom=ownKey(config.objects,key) || slots.some(t=>ownKey(config.frames,t.key));
+      const el=button(`${name(key)}${custom?' · 개별':''}`,()=>{selectedObject=key;renderList();renderDetail();},key===selectedObject?'selected':'');
+      el.title=key;ui.list.append(el);
+    }
+  }
+  function render() {
+    if (!ui) return;
+    [...ui.tabs.children].forEach((el,i)=>{el.classList.toggle('selected',CATEGORIES[i]===selectedCategory);el.setAttribute('aria-pressed',String(CATEGORIES[i]===selectedCategory));});
+    ui.global.replaceChildren(element('h3',`${selectedCategory==='plant'?'Plant (작물·식물) 전체':selectedCategory+' 전체'} 설정`));
+    ui.global.append(ruleEditor('groups',selectedCategory,null));
+    renderList();renderDetail();renderStatus();
+  }
+  function renderDetail() {
+    ui.detail.replaceChildren();
+    const entry=groups().find(([key])=>key===selectedObject);
+    if (!entry) {ui.detail.append(element('p','이름을 선택하면 개별 설정과 성장 단계별 스킨을 변경할 수 있습니다.','hint'));return;}
+    const [key,slots]=entry;
+    ui.detail.append(element('h3',name(key)),ruleEditor('objects',key,slots[0].key));
+    if (slots.length>1) ui.detail.append(element('p','성장 단계 / 프레임별 설정','hint'));
+    for (const target of slots) {
+      const block=element('details');block.open=slots.length===1;
+      block.append(element('summary',`${name(target.key)} · ${target.width}×${target.height}`));
+      block.append(ruleEditor('frames',target.key,target.key));
+      ui.detail.append(block);
+    }
+  }
+  function ruleEditor(scope,key,frameKey) {
+    const box=element('div',undefined,'editor');
+    const inherited=scope!=='groups' && !ownKey(config[scope],key);
+    const enabledConfig={...config,enabled:true};
+    const effective=scope==='groups' ? {...DEFAULT_RULE,...config.groups[key]} : scope==='objects' ? {...DEFAULT_RULE,...config.groups[categoryFor(key)],...config.objects[key]} : resolveRule(enabledConfig,frameKey);
+    if (scope!=='groups') {
+      const row=element('label',undefined,'check'), check=element('input');check.type='checkbox';check.checked=!inherited;
+      check.onchange=()=>{
+        if (check.checked) config[scope][key]={...effective};else delete config[scope][key];
+        change();render();
+      };
+      row.append(check,element('span',scope==='objects'?'개별 설정 사용 (전체보다 우선)':'이 프레임만 설정 (가장 우선)'));box.append(row);
+    }
+    const fields=element('fieldset');fields.disabled=inherited;
+    const hideLabel=element('label',undefined,'check'), hide=element('input');hide.type='checkbox';hide.checked=effective.hidden;
+    hide.onchange=()=>update({hidden:hide.checked});hideLabel.append(hide,element('span','숨기기'));fields.append(hideLabel);
+    slider('투명도',Math.round((1-effective.opacity)*100),0,100,1,value=>({opacity:Number((1-value/100).toFixed(2))}));
+    slider('크기',Math.round(effective.scale*100),10,300,5,value=>({scale:value/100}));
+    const imageRow=element('div',undefined,'image-row');
+    const file=element('input');file.type='file';file.accept='image/png,image/webp,image/jpeg,image/gif';file.hidden=true;
+    file.onchange=()=>{const selected=file.files[0];void upload(scope,key,selected).catch(report);file.value='';};
+    const pick=button(effective.imageId?'스킨 이미지 바꾸기':'스킨 이미지 추가',()=>file.click());
+    imageRow.append(pick,file,button('기본 이미지',()=>{update({imageId:null});render();}));
+    fields.append(imageRow,element('p',effective.imageId?'추가한 스킨에도 숨기기·투명도·크기가 적용됩니다.':'기본 게임 이미지에 숨기기·투명도·크기가 적용됩니다.','hint'));
+    if (frameKey && assets.has(effective.imageId)) {
+      const target=targets.get(frameKey),preview=composeCanvas(target,assets.get(effective.imageId),{...effective,scale:1});preview.className='preview';fields.append(preview);
+    }
+    if (scope==='groups') fields.append(button('이 전체 설정 초기화',()=>{delete config.groups[key];change();render();}));
+    box.append(fields);return box;
+    function update(patch) {
+      config[scope][key]={...config[scope][key],...patch};change();
+      if (scope==='groups') renderDetail();
+    }
+    function slider(label,value,min,max,step,patch) {
+      const row=element('label',undefined,'slider'),text=element('span',label),output=element('output',`${value}%`),input=element('input');
+      input.type='range';input.min=min;input.max=max;input.step=step;input.value=value;input.setAttribute('aria-label',label);
+      input.oninput=()=>output.textContent=`${input.value}%`;
+      input.onchange=()=>update(patch(Number(input.value)));
+      row.append(text,input,output);fields.append(row);
+    }
+  }
+}
+
+const SKINS_CSS = `
+:host{all:initial;font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#e8ecf1;position:fixed;z-index:2147483646;right:18px;bottom:20px;color-scheme:dark}
+*{box-sizing:border-box} [hidden]{display:none!important}
+button,input{font:inherit}button{cursor:pointer;border:1px solid #40534d;border-radius:9px;padding:7px 11px;background:#24332d;color:#e8ecf1;transition:background .12s}button:hover{background:#334d40}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid #b5e79f;outline-offset:2px}
+.launcher{background:#bedc9b;color:#1c2c20;font-weight:750;box-shadow:0 4px 22px #0007;padding:11px 16px}.launcher.off{background:#777f79;color:white}
+.panel{position:absolute;right:0;bottom:54px;width:min(850px,calc(100vw - 24px));height:min(820px,calc(100dvh - 100px));display:flex;flex-direction:column;background:#17231e;border:1px solid #536b59;border-radius:16px;box-shadow:0 16px 60px #0009;overflow:hidden;padding:16px;gap:10px}
+header{display:flex;align-items:center;justify-content:space-between;gap:10px}header strong{font-size:20px;letter-spacing:-.4px}header button{font-size:12px}.master{font-weight:800;background:#3b4540}.master.on{background:#b4d88d;color:#17281b;border-color:#b4d88d}nav{display:flex;gap:6px;flex-wrap:wrap}.selected{background:#536c46!important;color:#f1ffe8!important;border-color:#a5c08b!important}
+p,h3{margin:0}h3{font-size:14px;font-weight:750}.hint{font-size:12px;color:#acb9ae}.global{background:#202f26;border-radius:10px;padding:10px}.global .editor fieldset{display:grid;grid-template-columns:100px 1fr 1fr;gap:8px 16px;align-items:center}.global .image-row,.global .hint{grid-column:1/-1}.global fieldset>button{grid-column:1/-1;justify-self:start;font-size:12px}
+.panes{display:grid;grid-template-columns:210px 1fr;gap:12px;min-height:100px;flex:1;overflow:hidden}.browser{display:flex;flex-direction:column;gap:8px;min-height:0}.browser input{width:100%;border:1px solid #40534d;border-radius:8px;background:#101b16;color:#f2f6ed;padding:8px}.list{overflow:auto;display:flex;flex-direction:column;gap:5px;min-height:0;padding:2px}.list button{text-align:left;overflow-wrap:anywhere;font-size:13px}.detail{overflow:auto;background:#122019;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px}.editor fieldset{border:0;margin:0;padding:7px 0;min-width:0;display:flex;flex-direction:column;gap:10px}.editor fieldset:disabled{opacity:.42}.check{display:flex;gap:7px;align-items:center;font-size:13px}.check input{accent-color:#bedc9b}.slider{display:grid;grid-template-columns:50px minmax(60px,1fr) 45px;gap:6px;align-items:center;font-size:12px}.slider input{width:100%;accent-color:#c8e9a5}.slider output{text-align:right;font-variant-numeric:tabular-nums}.image-row{display:flex;gap:6px;flex-wrap:wrap}.image-row button{font-size:12px}.preview{width:72px;height:72px;object-fit:contain;image-rendering:pixelated;background:repeating-conic-gradient(#425045 0 25%,#25342b 0 50%) 0/14px 14px;border-radius:7px}details{border-top:1px solid #324539;padding-top:8px}summary{cursor:pointer;font-size:12px;overflow-wrap:anywhere}.status{font-size:12px;color:#b6c5b4;white-space:pre-line;max-height:75px;overflow:auto}.status.error{color:#ffc1ab}footer{display:flex;justify-content:space-between;gap:8px}footer button{font-size:12px}
+@media(max-width:600px){:host{right:12px;bottom:14px}.panel{padding:12px;gap:8px}.panes{grid-template-columns:125px 1fr;gap:7px}.detail{padding:9px}.global .editor fieldset{grid-template-columns:1fr}.global .image-row,.global .hint,.global fieldset>button{grid-column:auto}.global .editor fieldset>.hint{display:none}header strong{font-size:18px}nav button{padding:6px 8px;font-size:12px}.list button{padding:7px;font-size:12px}.slider{grid-template-columns:40px minmax(40px,1fr) 38px;gap:3px}}
+`;
+
+})();
+
+}
+// END embedded Snail with Skins
