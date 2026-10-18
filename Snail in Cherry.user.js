@@ -2,8 +2,8 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.5.0
-// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·스킨과 설정 백업
+// @version      1.6.0
+// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -29,7 +29,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.5.0', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.6.0', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -86,6 +86,7 @@
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
     feed: { hungerPotion:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
+    pots: { selected: {} },
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
     teams: { hatch: '', sell: '', restore: 'current' },
     registeredTeams: [], manualTeamsOpen: false,
@@ -101,7 +102,7 @@
       }
     };
     for (const key of ['autoBuy', 'autoStore', 'autoFeed','manualTeamsOpen']) bool(raw, key, s);
-    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed']) {
+    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed','pots']) {
       if (own(raw, section) && (!raw[section] || typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw Error(`${section}: 형식 오류`);
     }
     const dict = source => {
@@ -114,6 +115,7 @@
       return result;
     };
     if (own(raw, 'buy')) s.buy = dict(raw.buy);
+    if(own(raw.pots,'selected'))s.pots.selected=dict(raw.pots.selected);
     if(raw.feed) {
       bool(raw.feed,'hungerPotion',s.feed);
       if(own(raw.feed,'allowed'))s.feed.allowed=dict(raw.feed.allowed);
@@ -331,6 +333,63 @@
     const ids=members(team);
     if(!Array.isArray(team.members) || ids.length!==team.members.length || !ids.length || ids.length>3 || new Set(ids).size!==ids.length)throw Error('선택한 펫 팀의 구성원을 확인할 수 없습니다.');
     return team;
+  }
+  // v1634: journal seed rarity -> seed coin price -> catalog order. Rare Patch
+  // crops inherit their parent seed metadata; a pot always picks up the whole Patch.
+  const PATCH_PARENTS={PurpleDaisy:'Daisy',FourLeafClover:'Clover',SnowdropDouble:'Snowdrop',VariegatedCattail:'Cattail',Embercrown:'Emberbloom',Witchfire:'Foxfire'};
+  function potGroup(species,catalog) {
+    const parent=catalog.plants?.[species]?.rareCropOf || PATCH_PARENTS[species];
+    return parent && catalog.plants?.[parent]?.plant?.slotCapacity>0?parent:species;
+  }
+  function journalPlants(catalog) {
+    const ids=Object.keys(catalog.plants || {}),groups=new Map();
+    const rarities=Array.isArray(catalog.enums?.rarity)?catalog.enums.rarity:['Common','Uncommon','Rare','Legendary','Mythic','Mythical','Divine','Celestial'];
+    for(const id of ids) {
+      const group=potGroup(id,catalog);if(groups.has(group))continue;
+      const entry=catalog.plants[group];if(!entry?.plant || !entry?.seed)continue;
+      const aliases=ids.filter(s=>s!==group && potGroup(s,catalog)===group);
+      groups.set(group,{id:group,entry,aliases,index:ids.indexOf(group)});
+    }
+    const rarityName=value=>value==='Mythical'?'Mythic':value;
+    const rank=entry=>{const index=rarities.findIndex(r=>rarityName(r)===rarityName(entry.seed.rarity));return index<0?Infinity:index;};
+    return [...groups.values()].sort((a,b)=>rank(a.entry)-rank(b.entry) ||
+      (finite(a.entry.seed.coinPrice)?a.entry.seed.coinPrice:Infinity)-(finite(b.entry.seed.coinPrice)?b.entry.seed.coinPrice:Infinity) || a.index-b.index);
+  }
+  // Same six-plot DirtTiles geometry verified against the official v1634 map.
+  // Prefer the actual game map when available; do not guess a cell on a boardwalk.
+  function potTilePosition(slotIndex,localIndex) {
+    if(!Number.isInteger(slotIndex)||slotIndex<0||slotIndex>5||!Number.isInteger(localIndex)||localIndex<0||localIndex>=200)return null;
+    const x=localIndex%20;
+    return {x:14+(slotIndex%3)*26+x+(x>=10?1:0),y:14+Math.floor(slotIndex/3)*22+Math.floor(localIndex/20)};
+  }
+  function standingPlantSlot(root,selfId,map) {
+    const ownSlot=mySlot(root,selfId),index=root?.child?.data?.userSlots?.indexOf(ownSlot);
+    const position=ownSlot?.position ?? ownSlot?.data?.position;
+    if(index<0 || !Number.isInteger(position?.x) || !Number.isInteger(position?.y))return null;
+    if(map?.globalTileIdxToDirtTile && finite(map.cols)) {
+      const tile=map.globalTileIdxToDirtTile[position.y*map.cols+position.x];
+      return tile?.userSlotIdx===index && Number.isInteger(tile.dirtTileIdx)?tile.dirtTileIdx:null;
+    }
+    for(let slot=0;slot<200;slot++){const point=potTilePosition(index,slot);if(point?.x===position.x && point.y===position.y)return slot;}
+    return null;
+  }
+  const isPotPlant=tile=>tile?.objectType==='plant' && typeof tile.species==='string' && finite(tile.plantedAt) && Array.isArray(tile.slots);
+  const potPlantStamp=tile=>isPotPlant(tile)?JSON.stringify([tile.species,tile.plantedAt]):'';
+  function potTargets(data,catalog,selection,mode) {
+    return Object.entries(data.garden?.tileObjects || {}).filter(([slot,tile])=>Number.isInteger(Number(slot)) && Number(slot)>=0 && isPotPlant(tile) &&
+      (mode==='selected'?!!selection[potGroup(tile.species,catalog)]:!selection[potGroup(tile.species,catalog)])).map(([slot,tile])=>({slot:Number(slot),stamp:potPlantStamp(tile)})).sort((a,b)=>a.slot-b.slot);
+  }
+  const planterCount=data=>(data.inventory?.items || []).reduce((n,item)=>n+(item?.itemType==='Tool' && item.toolId==='PlanterPot'?quantity(item):0),0);
+  function planterAvailable(data) {
+    const items=(data.inventory?.items || []).filter(i=>i?.itemType==='Tool' && i.toolId==='PlanterPot' && quantity(i)>0);
+    if(!items.length)throw Error('화분 부족 · 인벤토리에 Planter Pot이 필요합니다.');
+    const locks=data.inventory?.favoritedItemIds;
+    if(!Array.isArray(locks))throw Error('화분 잠금 정보 확인 대기');
+    // The native planner consumes the first PlanterPot entry; never unlock or
+    // silently consume a locked stack, even if another unlocked stack follows it.
+    const first=items[0];if(first.locked || first.isLocked || first.favorited || locks.includes(first.id) || locks.includes(first.toolId))throw Error('화분 잠금 · 사용할 Planter Pot의 잠금을 해제하세요.');
+    if(data.inventory.items.filter(Boolean).length>=100)throw Error('인벤토리 가득 참 · 화분 담기 중단');
+    return first;
   }
   class NativeGameTeams {
     constructor(page,changed=()=>{}) {this.page=page;this.changed=changed;this.get=null;this.pending=null;this.lastTeams=null;this.unsub=[];}
@@ -642,7 +701,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -1082,6 +1141,53 @@
     }
     return moved ? `보관함 ${moved}개 이동` : '';
   }
+  function currentPotSlot() {
+    let map=null;
+    try{const atom=nativeGameTeams.atom('mapAtom');if(atom && nativeGameTeams.get)map=nativeGameTeams.get(atom);}catch{}
+    return standingPlantSlot(game.root,game.selfId,map);
+  }
+  async function potOne(job,target,standing=false) {
+    checkJob(job);
+    if(standing && currentPotSlot()!==target.slot)throw Error('위치가 바뀌어 담기를 중단했습니다. 작물 위에서 다시 누르세요.');
+    const data=game.data(),tile=garden(data)[target.slot];
+    if(!isPotPlant(tile) || potPlantStamp(tile)!==target.stamp)return false;
+    planterAvailable(data);
+    const before=planterCount(data),plantItemId=page.crypto.randomUUID(),species=tile.species;
+    report(`${catalog.plants?.[species]?.plant?.name || species} 담는 중…`);
+    await game.command('PotPlant',{slot:target.slot,plantItemId},next=> {
+      const potted=next.inventory.items.find(i=>i?.id===plantItemId);
+      return !!next.garden?.tileObjects && !next.garden.tileObjects[target.slot] && potted?.itemType==='Plant' && potted.species===species && Array.isArray(potted.slots) && planterCount(next)<before;
+    },12000,{stateConfirms:true});
+    return true;
+  }
+  function potStanding() {
+    void run('pot',async job=> {
+      const slot=currentPotSlot();
+      if(slot===null)throw Error('내 밭의 작물 위에 서서 담기를 누르세요.');
+      const tile=garden(game.data())[slot];
+      if(!isPotPlant(tile))throw Error('서 있는 칸에 담을 작물이 없습니다.');
+      const done=await potOne(job,{slot,stamp:potPlantStamp(tile)},true);checkJob(job);
+      report(done?'화분 담기 완료 · 1개':'대상 작물이 바뀌어 담지 않았습니다.');
+    });
+  }
+  function potSelection(mode) {
+    void run('pot',async job=> {
+      await loadCatalog();checkJob(job);
+      const selection={};
+      for(const [id,on] of Object.entries(settings.pots.selected))if(on && catalog.plants?.[id])selection[potGroup(id,catalog)]=true;
+      if(!Object.keys(selection).length)throw Error('작물 종류를 하나 이상 선택하세요.');
+      const targets=potTargets(game.data(),catalog,selection,mode);
+      let done=0,skipped=0;
+      try {
+        for(const target of targets) {
+          checkJob(job);
+          if(await potOne(job,target))done++;else skipped++;
+        }
+        checkJob(job);
+      }catch(error){throw Error(`화분 담기 ${done}개 확인 · ${error.message}`);}
+      report(`화분 담기 완료 · ${done}개${skipped?` · 바뀐 대상 ${skipped}개 제외`:''}`);
+    });
+  }
   async function applyTeam(id,job,restore = false) {
     if (!id) return;
     checkJob(job,restore);
@@ -1220,7 +1326,7 @@
     if (!force && (dragEgg || (content.contains(shadow.activeElement) && ['INPUT','SELECT'].includes(shadow.activeElement?.tagName)))) return;
     lastPaint=Date.now(); content.replaceChildren();
     panel.classList.toggle('home',view==='home');
-    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',settings:'설정' };
+    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',settings:'설정' };
     shadow.querySelector('.page-name').textContent=names[view];
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
@@ -1230,7 +1336,8 @@
         content.append(el('div',{ class:'menu-row' },button(`${glyph}  ${name}`,()=>go(key),'menu-link'),control));
       }
       if(homePage===1)content.append(el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),
-        switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')));
+        switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')),
+        el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')));
       content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...[
         ['연화','Yeonhwa'],['채리','Cherry'],['혜','Hye']
       ].map(([name,room])=>el('a',{text:name,href:`https://magicgarden.gg/r/${room.toLowerCase()}`,title:`${room} 방으로 이동`} ))));
@@ -1244,10 +1351,28 @@
       if (view==='hatch') renderHatch();
       if (view==='sell') renderSell();
       if (view==='feed') renderFeed();
+      if (view==='pot') renderPot();
       if (view==='settings') renderSettings();
     }
     if(footer.textContent!==status)footer.textContent=status;
     placePanel();
+  }
+  function renderPot() {
+    let data=null;try{data=game.data();}catch{}
+    content.append(el('small',{text:'아래 버튼은 내 밭을 일괄 처리합니다. 종류를 고른 뒤 담기를 실행하세요. 메뉴의 담기 버튼은 서 있는 칸만 처리합니다.'}));
+    const actions=el('div',{class:'pot-actions'},button('선택한 작물 담기',()=>potSelection('selected'),'primary'),button('선택 외 작물 담기',()=>potSelection('other')));
+    for(const control of actions.querySelectorAll('button'))control.disabled=!!running;
+    content.append(actions,el('small',{text:`인벤토리 화분 ${data?planterCount(data):'—'}개 · 작물 1칸당 화분 1개 사용`}),
+      el('small',{text:'Patch는 일반·희귀 작물이 섞여 있어도 통째로 담습니다. Clover(네잎클로버 포함)·Foxfire(Witchfire 포함)처럼 묶어서 선택합니다.'}));
+    const groups=journalPlants(catalog);
+    if(!groups.length)content.append(el('p',{text:'저널 작물 목록을 불러오는 중입니다.'}));
+    for(const {id,entry,aliases} of groups) {
+      const count=Object.values(data?.garden?.tileObjects || {}).filter(tile=>isPotPlant(tile) && potGroup(tile.species,catalog)===id).length;
+      const label=el('label',{class:'row pot-crop'}),input=el('input',{type:'checkbox',ariaLabel:`${entry.name || id} 담기 선택`,checked:[id,...aliases].some(s=>settings.pots.selected[s]),onchange:e=>{for(const alias of aliases)delete settings.pots.selected[alias];settings.pots.selected[id]=e.target.checked;save();}});
+      input.disabled=!!running;
+      const extra=aliases.length?` · ${aliases.map(s=>catalog.plants[s].name || s).join(', ')} 포함`:'';
+      label.append(input,itemLabel('Produce',id,`내 밭 ${count}칸${entry.plant.slotCapacity>0?' · Patch 전체':''}${extra}`));content.append(label);
+    }
   }
   function renderBuy() {
     content.append(row('입고 시 구매',switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매'),'접속·On·재입고 때 확인 · 품목 사이 1~3초'),
@@ -1568,6 +1693,7 @@
       .manual-team-input{display:flex;gap:4px;flex:1;min-width:0}.manual-team-input input{width:0;flex:1}.manual-team-input button{flex:none;font-size:10px;padding:4px 5px}.manual-team-current{overflow-wrap:anywhere;padding:5px 0}.manual-teams .category-body>small{padding-top:5px}
       .rooms{display:flex;gap:6px;padding-top:8px;margin-top:5px;border-top:1px solid #ffffff16}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
       .menu-pages{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid #ffffff16;margin-top:8px;padding-top:8px}.menu-pages button{padding:3px 13px}.menu-pages span{font-size:11px;color:#a7b7ad}.menu-pages button:disabled{opacity:.35;cursor:default}
+      .pot-actions{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}.pot-actions button{flex:1;padding:6px 4px;white-space:nowrap}.pot-crop input{accent-color:#6caf84;flex:none;margin:0 3px}
       .feed-pet{border-top:1px solid #ffffff14}.feed-pet>summary{padding:7px 0;background:none}.feed-pet>summary .item{min-width:0}.feed-pet>.row{padding:5px 0 5px 10px}.feed-pet>.row small:empty{display:none}
       .switch{display:inline-flex;flex:none;position:relative;width:35px;height:21px;cursor:pointer}.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.switch span{width:35px;height:21px;border-radius:12px;background:#ffffff24;pointer-events:none}.switch span:after{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#d7dedb;margin:3px;transition:transform .15s}.switch input:checked+span{background:#498060}.switch input:checked+span:after{transform:translateX(14px);background:#f1fff6}.switch input:focus-visible+span{outline:2px solid #6caf84;outline-offset:3px}
       select,input:not([type=checkbox]){background:#161d1acc;border:1px solid #ffffff26;border-radius:4px;padding:5px;max-width:100%;min-width:0}select option{background:#252e29;color:#e5e8e9}.row select{max-width:175px}.row input[type=number]{width:84px}.body>input{width:100%;margin:8px 0}.body>button{margin:6px 5px 3px 0}.primary{background:#3e664b;border-color:#6a9876;color:#f2fff6}.primary:hover{background:#4a775a}.item{display:flex;align-items:center;gap:9px;flex:1;min-width:0}.item img,.fallback{width:25px;height:25px;object-fit:contain;image-rendering:pixelated;flex:none}.fallback{text-align:center;line-height:25px}.grip{color:#88998f;cursor:grab;user-select:none}.arrows{display:flex;flex-direction:column;gap:2px}.arrows button{font-size:10px;padding:0 5px;border-radius:4px}
