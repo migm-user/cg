@@ -2,8 +2,8 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.6.1
-// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·스킨과 설정 백업
+// @version      1.6.2
+// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -29,7 +29,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.6.1', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.6.2', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -375,6 +375,31 @@
   }
   const isPotPlant=tile=>tile?.objectType==='plant' && typeof tile.species==='string' && finite(tile.plantedAt) && Array.isArray(tile.slots);
   const potPlantStamp=tile=>isPotPlant(tile)?JSON.stringify([tile.species,tile.plantedAt]):'';
+  const WEATHER_MUTATIONS=['Wet','Chilled','Frozen','Thunderstruck','Dawnlit','Ambershine','Dawncharged','Ambercharged','Thundercharged'];
+  function cleanserMutations(catalog) {
+    const order=catalog.enums?.mutationTierOrder;
+    return new Set((Array.isArray(order) && order.length?order:WEATHER_MUTATIONS)
+      .filter(id=>typeof id==='string' && id!=='Gold' && id!=='Rainbow' && catalog.mutations?.[id]?.group!=='Growth'));
+  }
+  const growSlotStamp=slot=>slot && Number.isInteger(slot.slotId) && typeof slot.species==='string' && finite(slot.startTime) ?
+    JSON.stringify([slot.slotId,slot.species,slot.startTime]):'';
+  function cleanserTargets(tile,catalog) {
+    if(!isPotPlant(tile))return [];
+    const weather=cleanserMutations(catalog),ids=new Set();
+    return tile.slots.filter(slot=>{
+      if(!growSlotStamp(slot) || slot.preserved || !Array.isArray(slot.mutations) || !slot.mutations.some(id=>weather.has(id)) || ids.has(slot.slotId))return false;
+      ids.add(slot.slotId);return true;
+    }).map(slot=>({slotId:slot.slotId,stamp:growSlotStamp(slot)}));
+  }
+  const cleanserCount=data=>(data.inventory?.items || []).reduce((n,item)=>n+(item?.itemType==='Tool' && item.toolId==='CropCleanser'?quantity(item):0),0);
+  function cleanserAvailable(data) {
+    const first=(data.inventory?.items || []).find(item=>item?.itemType==='Tool' && item.toolId==='CropCleanser' && quantity(item)>0);
+    if(!first)throw Error('Crop Cleanser 부족 · 인벤토리에 세정제가 필요합니다.');
+    const locks=data.inventory?.favoritedItemIds;
+    if(!Array.isArray(locks))throw Error('Crop Cleanser 잠금 정보 확인 대기');
+    if(foodLocked(data.inventory,first) || locks.includes(first.toolId))throw Error('Crop Cleanser 잠금 · 사용할 세정제의 잠금을 해제하세요.');
+    return first;
+  }
   function potTargets(data,catalog,selection,mode,direction='좌') {
     const tiles=data.garden?.tileObjects || {};
     return orderedTiles(direction,Object.keys(tiles).map(Number)).filter(slot=>isPotPlant(tiles[slot]) &&
@@ -726,7 +751,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -1166,13 +1191,24 @@
     }
     return moved ? `보관함 ${moved}개 이동` : '';
   }
-  function currentPotSlot() {
+  function currentStandingSlot() {
     const native=nativeGameTeams.location(game.selfId,game.root);
     return standingPlantSlot(game.root,game.selfId,native?.map,native?native.position:game.localPosition ?? undefined);
   }
+  async function standingCrop(job,action) {
+    await nativeGameTeams.connect();checkJob(job);
+    const native=nativeGameTeams.location(game.selfId,game.root),ownSlot=mySlot(game.root,game.selfId);
+    if(!native && !game.localPosition && !ownSlot?.position && !ownSlot?.data?.position)
+      throw Error(`현재 위치를 아직 읽지 못했습니다. 한 칸 이동한 뒤 ${action}를 다시 누르세요.`);
+    const slot=currentStandingSlot();
+    if(slot===null)throw Error(`내 밭의 작물 위에 서서 ${action}를 누르세요.`);
+    const tile=garden(game.data())[slot];
+    if(!isPotPlant(tile))throw Error('서 있는 칸에 작물이 없습니다.');
+    return {slot,tile};
+  }
   async function potOne(job,target,standing=false) {
     checkJob(job);
-    if(standing && currentPotSlot()!==target.slot)throw Error('위치가 바뀌어 담기를 중단했습니다. 작물 위에서 다시 누르세요.');
+    if(standing && currentStandingSlot()!==target.slot)throw Error('위치가 바뀌어 담기를 중단했습니다. 작물 위에서 다시 누르세요.');
     const data=game.data(),tile=garden(data)[target.slot];
     if(!isPotPlant(tile) || potPlantStamp(tile)!==target.stamp)return false;
     planterAvailable(data);
@@ -1186,16 +1222,45 @@
   }
   function potStanding() {
     void run('pot',async job=> {
-      await nativeGameTeams.connect();checkJob(job);
-      const native=nativeGameTeams.location(game.selfId,game.root),ownSlot=mySlot(game.root,game.selfId);
-      if(!native && !game.localPosition && !ownSlot?.position && !ownSlot?.data?.position)
-        throw Error('현재 위치를 아직 읽지 못했습니다. 한 칸 이동한 뒤 담기를 다시 누르세요.');
-      const slot=currentPotSlot();
-      if(slot===null)throw Error('내 밭의 작물 위에 서서 담기를 누르세요.');
-      const tile=garden(game.data())[slot];
-      if(!isPotPlant(tile))throw Error('서 있는 칸에 담을 작물이 없습니다.');
+      const {slot,tile}=await standingCrop(job,'담기');
       const done=await potOne(job,{slot,stamp:potPlantStamp(tile)},true);checkJob(job);
       report(done?'화분 담기 완료 · 1개':'대상 작물이 바뀌어 담지 않았습니다.');
+    });
+  }
+  function cleanseStanding() {
+    void run('cleanse',async job=> {
+      await loadCatalog();checkJob(job);
+      const {slot,tile}=await standingCrop(job,'지우기'),plantStamp=potPlantStamp(tile);
+      const weather=cleanserMutations(catalog),targets=cleanserTargets(tile,catalog);
+      const preserved=tile.slots.filter(s=>s?.preserved && s.mutations?.some(id=>weather.has(id))).length;
+      if(!targets.length){report(`지울 수 있는 날씨 변이가 없습니다.${preserved?' · 보존된 열매 제외':''} Gold·Rainbow는 유지됩니다.`);return;}
+      let done=0,skipped=0;
+      try {
+        for(const target of targets) {
+          checkJob(job);
+          if(currentStandingSlot()!==slot)throw Error('위치가 바뀌어 중단했습니다.');
+          const data=game.data(),current=garden(data)[slot];
+          if(potPlantStamp(current)!==plantStamp)throw Error('대상 작물이 바뀌어 중단했습니다.');
+          const fruit=current.slots.find(s=>s?.slotId===target.slotId);
+          if(growSlotStamp(fruit)!==target.stamp || fruit.preserved || !fruit.mutations?.some(id=>weather.has(id))){skipped++;continue;}
+          const plantMeta=catalog.plants?.[current.species]?.plant;
+          if(!plantMeta)throw Error('작물 정보 확인 대기');
+          if(plantMeta.harvestType!=='Single' && (!finite(current.maturedAt) || current.maturedAt>(game.serverNow() ?? Date.now())))
+            throw Error('아직 성장 중인 작물에는 Crop Cleanser를 사용할 수 없습니다.');
+          cleanserAvailable(data);
+          const before=cleanserCount(data),keep=fruit.mutations.filter(id=>!weather.has(id)).sort();
+          report(`변이 지우는 중… ${done}/${targets.length}`);
+          await game.command('CropCleanser',{tileObjectIdx:slot,growSlotIdx:target.slotId},next=> {
+            const plant=garden(next)[slot],after=plant?.slots?.find(s=>s?.slotId===target.slotId);
+            if(potPlantStamp(plant)!==plantStamp || growSlotStamp(after)!==target.stamp)throw Error('대상 작물 또는 열매가 바뀌어 중단했습니다.');
+            return Array.isArray(after.mutations) &&
+              !after.mutations.some(id=>weather.has(id)) && sameIds([...after.mutations].sort(),keep) && cleanserCount(next)<before;
+          },12000,{stateConfirms:true});
+          done++;report(`변이 지우기 · ${done}/${targets.length}`);
+        }
+        checkJob(job);
+      }catch(error){throw Error(`변이 지우기 ${done}개 확인 · ${error.message}`);}
+      report(`변이 지우기 완료 · 열매 ${done}개${preserved?` · 보존 ${preserved}개 제외`:''}${skipped?` · 바뀐 열매 ${skipped}개 제외`:''} · Gold·Rainbow 유지`);
     });
   }
   function potSelection(mode) {
@@ -1355,7 +1420,7 @@
     if (!force && (dragEgg || (content.contains(shadow.activeElement) && ['INPUT','SELECT'].includes(shadow.activeElement?.tagName)))) return;
     lastPaint=Date.now(); content.replaceChildren();
     panel.classList.toggle('home',view==='home');
-    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',settings:'설정' };
+    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',cleanse:'변이 지우기',settings:'설정' };
     shadow.querySelector('.page-name').textContent=names[view];
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
@@ -1366,7 +1431,8 @@
       }
       if(homePage===1)content.append(el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),
         switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')),
-        el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')));
+        el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')),
+        el('div',{class:'menu-row'},button('🫧 변이 지우기',()=>go('cleanse'),'menu-link'),button('지우기',cleanseStanding,'pill')));
       content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...[
         ['연화','Yeonhwa'],['채리','Cherry'],['혜','Hye']
       ].map(([name,room])=>el('a',{text:name,href:`https://magicgarden.gg/r/${room.toLowerCase()}`,title:`${room} 방으로 이동`} ))));
@@ -1381,6 +1447,10 @@
       if (view==='sell') renderSell();
       if (view==='feed') renderFeed();
       if (view==='pot') renderPot();
+      if (view==='cleanse') content.append(
+        el('p',{text:'메뉴의 지우기 버튼을 누르면 서 있는 자리에 있는 작물의 모든 열매에 Crop Cleanser를 사용해 날씨 변이를 지웁니다.'}),
+        el('p',{text:'Gold와 Rainbow에는 영향이 없습니다.'}),
+        el('small',{text:'열매마다 Crop Cleanser 1개를 사용합니다. 보존된 열매는 제외하며, 이동·세정제 부족·잠금 시에는 중단합니다.'}));
       if (view==='settings') renderSettings();
     }
     if(footer.textContent!==status)footer.textContent=status;
