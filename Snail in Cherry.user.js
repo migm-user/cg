@@ -2,7 +2,7 @@
 // @name         Snail in Cherry
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.6.0
+// @version      1.6.1
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -29,7 +29,7 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.6.0', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.6.1', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -362,9 +362,9 @@
     const x=localIndex%20;
     return {x:14+(slotIndex%3)*26+x+(x>=10?1:0),y:14+Math.floor(slotIndex/3)*22+Math.floor(localIndex/20)};
   }
-  function standingPlantSlot(root,selfId,map) {
+  function standingPlantSlot(root,selfId,map,currentPosition) {
     const ownSlot=mySlot(root,selfId),index=root?.child?.data?.userSlots?.indexOf(ownSlot);
-    const position=ownSlot?.position ?? ownSlot?.data?.position;
+    const position=currentPosition===undefined ? ownSlot?.position ?? ownSlot?.data?.position : currentPosition;
     if(index<0 || !Number.isInteger(position?.x) || !Number.isInteger(position?.y))return null;
     if(map?.globalTileIdxToDirtTile && finite(map.cols)) {
       const tile=map.globalTileIdxToDirtTile[position.y*map.cols+position.x];
@@ -375,9 +375,11 @@
   }
   const isPotPlant=tile=>tile?.objectType==='plant' && typeof tile.species==='string' && finite(tile.plantedAt) && Array.isArray(tile.slots);
   const potPlantStamp=tile=>isPotPlant(tile)?JSON.stringify([tile.species,tile.plantedAt]):'';
-  function potTargets(data,catalog,selection,mode) {
-    return Object.entries(data.garden?.tileObjects || {}).filter(([slot,tile])=>Number.isInteger(Number(slot)) && Number(slot)>=0 && isPotPlant(tile) &&
-      (mode==='selected'?!!selection[potGroup(tile.species,catalog)]:!selection[potGroup(tile.species,catalog)])).map(([slot,tile])=>({slot:Number(slot),stamp:potPlantStamp(tile)})).sort((a,b)=>a.slot-b.slot);
+  function potTargets(data,catalog,selection,mode,direction='좌') {
+    const tiles=data.garden?.tileObjects || {};
+    return orderedTiles(direction,Object.keys(tiles).map(Number)).filter(slot=>isPotPlant(tiles[slot]) &&
+      (mode==='selected'?!!selection[potGroup(tiles[slot].species,catalog)]:!selection[potGroup(tiles[slot].species,catalog)]))
+      .map(slot=>({slot,stamp:potPlantStamp(tiles[slot])}));
   }
   const planterCount=data=>(data.inventory?.items || []).reduce((n,item)=>n+(item?.itemType==='Tool' && item.toolId==='PlanterPot'?quantity(item):0),0);
   function planterAvailable(data) {
@@ -398,6 +400,21 @@
       if(!cache?.entries)return null;
       for(const [key,atom] of cache.entries())if(atom && (atom.debugLabel===label || atom.label===label || String(key).endsWith('/'+label)))return atom;
       return null;
+    }
+    location(selfId,roomState) {
+      if(!this.get)return null;
+      try {
+        const read=label=>{const atom=this.atom(label);return atom?this.get(atom):undefined;};
+        const state=read('stateAtom'),root=state?.child?state:state?.state,me=read('playerAtom');
+        if((me?.id && selfId && String(me.id)!==String(selfId)) ||
+          (root?.data?.roomSessionId && roomState?.data?.roomSessionId && root.data.roomSessionId!==roomState.data.roomSessionId))return {position:null,map:null};
+        // localPlayerPositionAtom is null when unseated. Never replace that with
+        // lastPositionInMyGardenAtom or a stale server snapshot.
+        const position=read('localPlayerPositionAtom');
+        const current=position===undefined?read('positionAtom'):position;
+        if(current===undefined)return null;
+        return {position:current,map:read('mapAtom')};
+      }catch{return null;}
     }
     read(selfId,roomState) {
       if(!this.get)return null;
@@ -514,15 +531,19 @@
       this.selfId = ''; this.generation = 0; this.revision = 0; this.pending = new Map(); this.sessions = new WeakMap();
       this.shopWatch = new Map();
       this.serverClock=null;
+      this.localPosition=null;
       this.nativeTeamAttempt=null;this.lastNativeTeam=null;
     }
     install() {
       const link = this, Native = this.page.WebSocket, original = Native.prototype.send;
       Native.prototype.send = function (payload) {
         const session = link.track(this);
+        let position=null;
         if (this === link.socket && typeof payload === 'string') {
           try {
             const msg = JSON.parse(payload);
+            if(msg.type==='PlayerPosition' && Array.isArray(msg.scopePath) && msg.scopePath.at(-1)==='Quinoa' &&
+              Number.isInteger(msg.position?.x) && Number.isInteger(msg.position?.y))position={x:msg.position.x,y:msg.position.y};
             if (msg.type === 'QuinoaCommand') {
               let seq = session.sent.get(msg.requestId);
               if (!seq) {
@@ -542,7 +563,10 @@
             }
           } catch { /* Non-JSON messages are owned by the game. */ }
         }
-        return original.call(this,payload);
+        const result=original.call(this,payload);
+        // Observe the game's existing movement; do not generate movement requests.
+        if(position && this===link.socket && link.root)link.localPosition=position;
+        return result;
       };
       this.page.WebSocket = new Proxy(Native, {
         construct(target,args,newTarget) {
@@ -575,6 +599,7 @@
     }
     invalidate(reason) {
       this.root = null; this.generation++;this.serverClock=null;
+      this.localPosition=null;
       this.nativeTeamAttempt=null;this.lastNativeTeam=null;
       for (const p of this.pending.values()) p.error = Error(reason);
       this.changed(reason);
@@ -1142,9 +1167,8 @@
     return moved ? `보관함 ${moved}개 이동` : '';
   }
   function currentPotSlot() {
-    let map=null;
-    try{const atom=nativeGameTeams.atom('mapAtom');if(atom && nativeGameTeams.get)map=nativeGameTeams.get(atom);}catch{}
-    return standingPlantSlot(game.root,game.selfId,map);
+    const native=nativeGameTeams.location(game.selfId,game.root);
+    return standingPlantSlot(game.root,game.selfId,native?.map,native?native.position:game.localPosition ?? undefined);
   }
   async function potOne(job,target,standing=false) {
     checkJob(job);
@@ -1162,6 +1186,10 @@
   }
   function potStanding() {
     void run('pot',async job=> {
+      await nativeGameTeams.connect();checkJob(job);
+      const native=nativeGameTeams.location(game.selfId,game.root),ownSlot=mySlot(game.root,game.selfId);
+      if(!native && !game.localPosition && !ownSlot?.position && !ownSlot?.data?.position)
+        throw Error('현재 위치를 아직 읽지 못했습니다. 한 칸 이동한 뒤 담기를 다시 누르세요.');
       const slot=currentPotSlot();
       if(slot===null)throw Error('내 밭의 작물 위에 서서 담기를 누르세요.');
       const tile=garden(game.data())[slot];
@@ -1176,12 +1204,13 @@
       const selection={};
       for(const [id,on] of Object.entries(settings.pots.selected))if(on && catalog.plants?.[id])selection[potGroup(id,catalog)]=true;
       if(!Object.keys(selection).length)throw Error('작물 종류를 하나 이상 선택하세요.');
-      const targets=potTargets(game.data(),catalog,selection,mode);
+      const targets=potTargets(game.data(),catalog,selection,mode,settings.eggs.direction);
+      if(!targets.length){report('조건에 맞는 담을 작물이 없습니다.');return;}
       let done=0,skipped=0;
       try {
         for(const target of targets) {
           checkJob(job);
-          if(await potOne(job,target))done++;else skipped++;
+          if(await potOne(job,target)){done++;report(`화분 담기 · ${done}/${targets.length}`);}else skipped++;
         }
         checkJob(job);
       }catch(error){throw Error(`화분 담기 ${done}개 확인 · ${error.message}`);}
@@ -1359,7 +1388,10 @@
   }
   function renderPot() {
     let data=null;try{data=game.data();}catch{}
-    content.append(el('small',{text:'아래 버튼은 내 밭을 일괄 처리합니다. 종류를 고른 뒤 담기를 실행하세요. 메뉴의 담기 버튼은 서 있는 칸만 처리합니다.'}));
+    content.append(el('small',{text:'아래 버튼은 알 심기·부화처럼 내 밭을 지그재그 순서로 처리합니다. 서 있는 위치와 관계없이 실행할 수 있습니다. 메뉴의 담기 버튼은 서 있는 칸만 처리합니다.'}));
+    const direction=select(settings.eggs.direction,['좌','우'].map(x=>[x,x]),v=>{settings.eggs.direction=v;refresh();},'화분 담기 시작 방향');
+    direction.disabled=!!running;
+    content.append(row('시작 방향',direction,'알 심기·부화와 같은 방향 설정'));
     const actions=el('div',{class:'pot-actions'},button('선택한 작물 담기',()=>potSelection('selected'),'primary'),button('선택 외 작물 담기',()=>potSelection('other')));
     for(const control of actions.querySelectorAll('button'))control.disabled=!!running;
     content.append(actions,el('small',{text:`인벤토리 화분 ${data?planterCount(data):'—'}개 · 작물 1칸당 화분 1개 사용`}),
