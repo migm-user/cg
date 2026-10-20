@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.7.2
+// @version      1.7.3
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -30,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.7.2', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.7.3', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -98,7 +98,7 @@
   }
   const defaults = () => ({
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
-    feed: { hungerPotion:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
+    feed: { potionDefault:true,allowLockedPotions:true,allowLockedCrops:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
     pots: { selected: {} },
     cleanse: { selected: {} }, rooms: defaultRooms(false),
@@ -138,8 +138,17 @@
       s.rooms=raw.rooms.map(roomShortcut);
     }
     if(raw.feed) {
-      bool(raw.feed,'hungerPotion',s.feed);
       if(own(raw.feed,'allowed'))s.feed.allowed=dict(raw.feed.allowed);
+      for(const key of ['potionDefault','allowLockedPotions','allowLockedCrops'])bool(raw.feed,key,s.feed);
+      // Convert the removed master gate into ordinary per-pet choices. These
+      // choices can be enabled individually or by the remaining bulk button.
+      if(own(raw.feed,'hungerPotion')) {
+        if(typeof raw.feed.hungerPotion!=='boolean')throw Error('hungerPotion: On/Off 값이 잘못되었습니다.');
+        if(!own(raw.feed,'potionDefault') && !raw.feed.hungerPotion) {
+          s.feed.potionDefault=false;
+          for(const key of Object.keys(s.feed.allowed))if(key.endsWith(':Tool:ReplenishPotion'))s.feed.allowed[key]=false;
+        }
+      }
       for(const key of ['openEggs','openPets'])if(own(raw.feed,key)) {
         if(!Array.isArray(raw.feed[key]) || raw.feed[key].length>1000 || raw.feed[key].some(v=>typeof v!=='string'||!/^[\w:.-]{1,160}$/.test(v)))throw Error('펫 먹이 접기 설정 오류');
         s.feed[key]=[...new Set(raw.feed[key])];
@@ -552,7 +561,8 @@
   }
   const foodKey = (species,type,id) => `${species}:${type}:${id}`;
   const foodAllowed = (settings,species,type,id) =>
-    !(type==='Tool' && id==='ReplenishPotion' && settings.feed.hungerPotion===false) && settings.feed.allowed[foodKey(species,type,id)]!==false;
+    settings.feed.allowed[foodKey(species,type,id)] ?? (type==='Tool' && id==='ReplenishPotion'?settings.feed.potionDefault!==false:true);
+  const lockedFoodAllowed=(settings,item)=>item?.itemType==='Tool'?settings.feed.allowLockedPotions!==false:settings.feed.allowLockedCrops!==false;
   function feedChoiceKeys(catalog,type) {
     return Object.entries(catalog.pets || {}).flatMap(([species,pet])=>type==='potion'?[foodKey(species,'Tool','ReplenishPotion')]:
       [...new Set(Array.isArray(pet.diet)?pet.diet:[])].map(id=>foodKey(species,'Produce',id)));
@@ -560,36 +570,33 @@
   function feedBulkState(settings,catalog,type) {
     const keys=feedChoiceKeys(catalog,type);
     if(!keys.length)return 'empty';
-    const count=keys.filter(key=>settings.feed.allowed[key]!==false).length;
+    const count=keys.filter(key=>settings.feed.allowed[key] ?? (type==='potion'?settings.feed.potionDefault!==false:true)).length;
     return count===keys.length?'on':count===0?'off':'mixed';
   }
   function setFeedChoices(settings,catalog,type,on) {
+    if(type==='potion') {
+      settings.feed.potionDefault=on;
+      for(const key of Object.keys(settings.feed.allowed))if(key.endsWith(':Tool:ReplenishPotion'))settings.feed.allowed[key]=on;
+    }
     for(const key of feedChoiceKeys(catalog,type))settings.feed.allowed[key]=on;
   }
   function chooseFood(data,pet,catalog,settings) {
-    const diet=catalog.pets?.[pet.petSpecies]?.diet;
-    if(!Array.isArray(diet))return null;
-    const produce=i=>i?.itemType==='Produce' && i.id && diet.includes(i.species) && quantity(i)>0 && foodAllowed(settings,pet.petSpecies,'Produce',i.species);
-    const potion=i=>i?.itemType==='Tool' && i.toolId==='ReplenishPotion' && quantity(i)>0 && foodAllowed(settings,pet.petSpecies,'Tool','ReplenishPotion');
-    const items=data.inventory?.items || [],storages=data.inventory?.storages || [];
-    // Locks deliberately do not filter food: the user explicitly enables feeding locked items.
-    for(const [test,storageId] of [[produce,'FeedingTrough'],[potion,'ToolShack']]) {
-      const item=items.find(test);if(item)return {item};
-      const storage=storages.find(s=>(s.decorId || s.id)===storageId);
-      const stored=storageItems(storage).find(test);if(stored)return {item:stored,storageId};
-    }
+    const meta=catalog.pets?.[pet.petSpecies];if(!meta)return null;
+    const diet=Array.isArray(meta.diet)?meta.diet:[],inventory=data.inventory || {},items=inventory.items || [];
+    const eligible=i=>!foodLocked(inventory,i) || lockedFoodAllowed(settings,i);
+    const crop=items.find(i=>i?.itemType==='Produce' && i.id && diet.includes(i.species) && quantity(i)>0 && foodAllowed(settings,pet.petSpecies,'Produce',i.species) && eligible(i));
+    if(crop)return {item:crop};
+    // The native potion command consumes the FIRST matching inventory stack;
+    // it has no item/position selector. Never substitute a different stack.
+    const potion=items.find(i=>i?.itemType==='Tool' && i.toolId==='ReplenishPotion');
+    if(potion && quantity(potion)>0 && foodAllowed(settings,pet.petSpecies,'Tool','ReplenishPotion') && eligible(potion))return {item:potion};
     return null;
   }
-  function petPosition(data,id,serverNow=null) {
-    const info=data.petSlotInfos?.[id],motion=info?.motion;
-    let p=motion ? ((!motion.kind || motion.kind==='idle') ? motion.at : null) : info?.position;
-    if(!p && Array.isArray(motion?.path) && motion.path.length && finite(serverNow) && finite(motion.startedAtMs) && finite(motion.stepDurationMs) && motion.stepDurationMs>=0 &&
-      serverNow>=motion.startedAtMs+motion.stepDurationMs*(motion.path.length-1))p=motion.path.at(-1);
-    return finite(p?.x)&&finite(p?.y)?{x:p.x,y:p.y}:null;
-  }
-  const samePoint=(a,b)=>a && b && a.x===b.x && a.y===b.y;
   const foodLocked=(inventory,item)=>!!item && (item.locked===true || item.isLocked===true || item.favorited===true ||
-    (typeof item.id==='string' && inventory.favoritedItemIds?.includes(item.id)));
+    (typeof item.id==='string' && inventory.favoritedItemIds?.includes(item.id)) ||
+    (item.itemType==='Tool' && inventory.favoritedItemIds?.includes(item.toolId)));
+  const foodLockKey=(inventory,item)=>item?.itemType==='Tool' && inventory.favoritedItemIds?.includes(item.toolId)?item.toolId:
+    (typeof item?.id==='string' && item.id?item.id:item?.itemType==='Tool'?item.toolId:null);
 
   class GameLink {
     constructor(page, changed = () => {}) {
@@ -792,7 +799,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { foodAllowed,foodLocked,foodLockKey,lockedFoodAllowed,defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -1043,79 +1050,44 @@
     if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return;
     const recipient={...pet};
     const notice=(event,message)=>{report(`${recipient.name || title('Pet',recipient.petSpecies)} · ${message}`);notifyFeed(recipient,event,message);};
-    let selected=chooseFood(game.data(),pet,catalog,settings);
+    const selected=chooseFood(game.data(),pet,catalog,settings);
     if(!selected) {
       if(state){state.complete=false;state.waiting=true;}
-      notice('급식 대기','사용 가능한 먹이 없음 · 먹이 입고 시 다시 확인');return;
+      notice('급식 대기','인벤토리에서 사용 가능한 먹이 없음 · 먹이·설정 변경 시 다시 확인');return;
     }
-    let unlockedId=null;
-    let food=selected.item;
+    let unlockedKey=null;
+    const food=selected.item,potion=food.itemType==='Tool';
+    let wasLocked=foodLocked(game.data().inventory,food);
+    const sameFood=item=>potion?item?.itemType==='Tool' && item.toolId===food.toolId:item?.id===food.id;
     const canFeedSelected=()=> {
       checkJob(job);pet=current();
       if(!pet || !hungryStage(pet,catalog) || pet.hunger>entry.hunger)return false;
-      if(foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId))return true;
+      if(foodAllowed(settings,pet.petSpecies,food.itemType,food.species || food.toolId) && (!wasLocked || lockedFoodAllowed(settings,food)))return true;
       if(state){state.complete=false;state.waiting=true;}
       notice('급식 취소','먹이 선택 변경 · 선택한 먹이 급식 취소');
       return false;
     };
-    let moveDeadline=0,moves=0;
-    async function preparePotion() {
-      // /data supplies item metadata, not use requirements. Confirm the live game's
-      // co-location requirement before and after unlocking; never chase a pet indefinitely.
-      if(!moveDeadline)moveDeadline=Date.now()+8000;
-      while(true) {
-        if(!canFeedSelected())return false;
-        const position=petPosition(game.data(),entry.id,game.serverNow());
-        if(position && samePoint(game.data().position,position))return true;
-        if(Date.now()>=moveDeadline)throw Error('펫 위치·이동 확인 대기 · 포션 미사용');
-        if(!position){await sleep(100);continue;}
-        if(moves>=2)throw Error('펫이 계속 이동하여 포션 사용 보류');
-        moves++;
-        await game.command('Teleport',{position},next=>samePoint(next.position,position),moveDeadline-Date.now(),{flat:true,stateConfirms:true});
-      }
-    }
     try {
       checkJob(job);
-      if(selected.storageId) {
-        const data=game.data();
-        if(data.inventory.items.filter(Boolean).length>=CAPACITY)throw Error('인벤토리 가득 참 · 먹이를 꺼낼 수 없습니다.');
-        const key=moveItemKey(food),prior=quantity(food);
-        if(!key)throw Error('먹이 이동 식별자 확인 대기');
-        // Food UUIDs are retained by retrieval; potions may merge into an existing stack.
-        const owned=food.itemType==='Tool'?purchaseCapacity(data,food).held:quantity(data.inventory.items.find(i=>i?.id===food.id) || {quantity:0});
-        await game.command('MoveItem',{from:selected.storageId,to:'inventory',itemId:key,quantity:1},next=> {
-          const source=next.inventory.storages?.find(s=>(s.decorId || s.id)===selected.storageId);
-          const left=storageItems(source).find(i=>moveItemKey(i)===key);
-          const now=food.itemType==='Tool'?purchaseCapacity(next,food).held:quantity(next.inventory.items.find(i=>i?.id===food.id) || {quantity:0});
-          return now>owned && (!left || quantity(left)<prior);
-        },12000,{stateConfirms:true});
-        food=game.data().inventory.items.find(i=>food.itemType==='Tool'?i?.toolId===food.toolId:i?.id===food.id);
-        if(!food)throw Error('꺼낸 먹이 확인 실패');
-      }
       if(!canFeedSelected())return;
-      if(foodLocked(game.data().inventory,food) && (typeof food.id!=='string' || !food.id))throw Error('먹이 개별 ID 확인 대기 · 잠금 유지');
-      if(food.itemType==='Tool' && !await preparePotion())return;
-      if(!canFeedSelected())return;
-      // Only the selected item's own ID may be unlocked; species/tool IDs are never lock keys.
       const inv=game.data().inventory;
       if(!Array.isArray(inv.favoritedItemIds))throw Error('먹이 잠금 정보 확인 대기');
-      const candidate=inv.items.find(i=>food.id ? i?.id===food.id : i?.itemType==='Tool' && i.toolId===food.toolId);
-      if(!candidate || quantity(candidate)<=0)throw Error('선택한 먹이가 없어 급식 보류');
+      const candidate=inv.items.find(sameFood);
+      if(!candidate || (food.id && candidate.id!==food.id) || quantity(candidate)<=0)throw Error('선택한 먹이가 없어 급식 보류');
       if(foodLocked(inv,candidate)) {
-        if(typeof candidate.id!=='string' || !candidate.id)throw Error('먹이 개별 ID 확인 대기 · 잠금 유지');
-        unlockedId=candidate.id;
-        await game.command('ToggleLockItem',{itemId:unlockedId},next=> {
-          const selected=next.inventory.items.find(i=>i?.id===unlockedId);
+        wasLocked=true;if(!canFeedSelected())return;
+        // Crops use individual IDs. Native tool locks may use the toolId.
+        unlockedKey=foodLockKey(inv,candidate);
+        if(!unlockedKey)throw Error('먹이 잠금 식별자 확인 대기 · 잠금 유지');
+        await game.command('ToggleLockItem',{itemId:unlockedKey},next=> {
+          const selected=next.inventory.items.find(sameFood);
           return !!selected && !foodLocked(next.inventory,selected);
         },12000,{stateConfirms:true});
       }
-      if(food.itemType==='Tool' && !await preparePotion())return;
       if(!canFeedSelected())return;
-      const dataBefore=game.data(),potion=food.itemType==='Tool';
-      if(potion && !samePoint(dataBefore.position,petPosition(dataBefore,entry.id,game.serverNow())))throw Error('펫이 이동하여 포션 사용 보류');
-      const selectedNow=dataBefore.inventory.items.find(i=>potion?i?.itemType==='Tool' && i.toolId===food.toolId:i?.id===food.id);
+      const dataBefore=game.data(),selectedNow=dataBefore.inventory.items.find(sameFood);
       if(!selectedNow || (food.id && selectedNow.id!==food.id) || quantity(selectedNow)<=0 || foodLocked(dataBefore.inventory,selectedNow))throw Error('먹이 수량·잠금·선택 변경 · 급식 보류');
-      const countSelected=next=>food.id ? quantity(next.inventory.items.find(i=>i?.id===food.id) || {quantity:0}) : purchaseCapacity(next,food).held;
+      const countSelected=next=>potion?purchaseCapacity(next,food).held:quantity(next.inventory.items.find(sameFood) || {quantity:0});
       const beforeHunger=pet.hunger,beforeCount=countSelected(dataBefore);
       lastFeedAt=Date.now();
       await game.command(potion?'ReplenishPotion':'FeedPet',potion?{petItemId:pet.id}:{petItemId:pet.id,cropItemId:food.id},next=> {
@@ -1127,14 +1099,15 @@
     }catch(error){
       notice('급식 중단',error.message);
     }finally{
-      if(unlockedId) {
+      if(unlockedKey) {
         try {
           checkJob(job,true);
           const inv=game.data().inventory;
-          const remaining=[...inv.items,...(inv.storages || []).flatMap(storageItems)].find(i=>i?.id===unlockedId);
+          const matchesLock=item=>potion && unlockedKey===food.toolId?sameFood(item):item?.id===unlockedKey;
+          const remaining=[...inv.items,...(inv.storages || []).flatMap(storageItems)].find(matchesLock);
           if(remaining && !foodLocked(inv,remaining))
-            await game.command('ToggleLockItem',{itemId:unlockedId},next=> {
-              const same=[...next.inventory.items,...(next.inventory.storages || []).flatMap(storageItems)].find(i=>i?.id===unlockedId);
+            await game.command('ToggleLockItem',{itemId:unlockedKey},next=> {
+              const same=[...next.inventory.items,...(next.inventory.storages || []).flatMap(storageItems)].find(matchesLock);
               return !!same && foodLocked(next.inventory,same);
             },12000,{stateConfirms:true});
         }catch(error){notice('잠금 복구 확인 필요',error.message);}
@@ -1627,21 +1600,20 @@
   }
   function renderFeed() {
     content.append(row('펫 먹이',switchFor(settings.autoFeed,setAutoFeed,'펫 먹이 자동 지급'),'사용 중인 펫 · 배고픔 5% 미만'),
-      row('Hunger Potion 전체 허용',switchFor(settings.feed.hungerPotion,v=>{
-        settings.feed.hungerPotion=v;observeFeed();refresh(true);
-      },'Hunger Potion 전체 허용'),'Off이면 모든 동물에게 포션 지급 제외 · 개별 선택 유지'),
+      row('잠긴 포션 사용',switchFor(settings.feed.allowLockedPotions,v=>{settings.feed.allowLockedPotions=v;observeFeed();},'잠긴 포션 사용'),'Off이면 잠긴 Hunger Potion은 사용하지 않습니다.'),
+      row('잠긴 작물 사용',switchFor(settings.feed.allowLockedCrops,v=>{settings.feed.allowLockedCrops=v;observeFeed();},'잠긴 작물 사용'),'Off이면 잠긴 작물은 먹이로 사용하지 않습니다.'),
       el('small',{text:'알림 후 1~5초 대기 · 여러 펫은 2초 간격 · 일반 먹이 우선, 허용한 포션만 사용'}),
-      el('small',{text:'선택한 먹이만 잠금 해제하고, 남아 있으면 다시 잠급니다.'}));
+      el('small',{text:'인벤토리의 먹이만 사용합니다. 보관함에서 꺼내지 않습니다. 허용한 잠긴 먹이는 사용 직전에 잠금을 풀고, 남아 있으면 다시 잠급니다.'}));
     const bulk=el('div',{class:'feed-bulk'});
     for(const [type,label] of [['potion','Hunger Potion'],['produce','작물 먹이']]) {
       const state=feedBulkState(settings,catalog,type),text=state==='mixed'?`${label} 개별 적용`:`모든 ${label} ${state==='off'?'꺼짐':'켜짐'}`;
       const control=button(text,()=>{
         const on=feedBulkState(settings,catalog,type)!=='on';setFeedChoices(settings,catalog,type,on);save();observeFeed();refresh(true);
-        report(`${label} 펫별 선택을 모두 ${on?'켰습니다.':'껐습니다.'}${type==='potion' && !settings.feed.hungerPotion?' · 전체 허용 Off로 포션 급식은 차단 중':''}`);
+        report(`${label} 펫별 선택을 모두 ${on?'켰습니다.':'껐습니다.'}`);
       });
       control.dataset.feedBulk=type;control.disabled=state==='empty';bulk.append(control);
     }
-    content.append(bulk,el('small',{text:'버튼은 모든 펫의 선택을 변경합니다. 개별 적용에서 누르면 모두 켜집니다. 포션 전체 허용 Off이면 펫별 선택과 관계없이 포션을 주지 않습니다.'}));
+    content.append(bulk,el('small',{text:'버튼은 모든 펫의 먹이 선택을 변경합니다. 개별 적용에서 누르면 모두 켜집니다. 잠긴 먹이를 쓸지는 위의 포션·작물 설정을 각각 따릅니다.'}));
     const groups=petFoodGroups(catalog);
     if(!groups.length)content.append(el('p',{text:'동물과 먹이 정보를 불러오는 중입니다.'}));
     function folded(key,id,label,className) {
@@ -1666,7 +1638,6 @@
           const toggle=switchFor(foodAllowed(settings,species,type,id),v=>{
             settings.feed.allowed[key]=v;observeFeed();syncFeedBulk();
           },`${title('Pet',species)} · ${title(type,id)} 먹이`);
-          if(type==='Tool' && id==='ReplenishPotion' && !settings.feed.hungerPotion)toggle.querySelector('input').disabled=true;
           animal.append(el('div',{class:'row'},itemLabel(type,id,''),toggle));
         }
         body.append(animal);
