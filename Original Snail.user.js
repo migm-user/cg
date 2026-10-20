@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.7.1
+// @version      1.7.2
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -30,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.7.1', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.7.2', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -404,18 +404,19 @@
   }
   const growSlotStamp=slot=>slot && Number.isInteger(slot.slotId) && typeof slot.species==='string' && finite(slot.startTime) ?
     JSON.stringify([slot.slotId,slot.species,slot.startTime]):'';
-  function cleanserTargets(tile,catalog) {
+  function cleanserTargets(tile,catalog,selection,mode='selected') {
     if(!isPotPlant(tile))return [];
     const weather=cleanserMutations(catalog),ids=new Set();
     return tile.slots.filter(slot=>{
-      if(!growSlotStamp(slot) || slot.preserved || !Array.isArray(slot.mutations) || !slot.mutations.some(id=>weather.has(id)) || ids.has(slot.slotId))return false;
+      if(!growSlotStamp(slot) || slot.preserved || !Array.isArray(slot.mutations) || !slot.mutations.some(id=>weather.has(id)) || ids.has(slot.slotId) ||
+        (selection!==undefined && !cleanserFruitSelected(slot,catalog,selection,mode)))return false;
       ids.add(slot.slotId);return true;
     }).map(slot=>({slotId:slot.slotId,stamp:growSlotStamp(slot)}));
   }
-  function cleanserPlantSelected(tile,catalog,selection,mode='selected') {
+  function cleanserFruitSelected(fruit,catalog,selection,mode='selected') {
     const weather=cleanserMutations(catalog),chosen=Object.keys(selection).filter(id=>selection[id] && weather.has(id));
-    if(!isPotPlant(tile) || !chosen.length)return false;
-    const matches=tile.slots.some(fruit=>fruit?.mutations?.some(id=>chosen.includes(id)));
+    if(!Array.isArray(fruit?.mutations) || !chosen.length)return false;
+    const matches=fruit.mutations.some(id=>chosen.includes(id));
     return mode==='other'?!matches:matches;
   }
   const cleanserCount=data=>(data.inventory?.items || []).reduce((n,item)=>n+(item?.itemType==='Tool' && item.toolId==='CropCleanser'?quantity(item):0),0);
@@ -791,7 +792,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserPlantSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -1278,12 +1279,9 @@
       const weather=cleanserMutations(catalog),selection=Object.fromEntries(Object.entries(settings.cleanse.selected).filter(([id,on])=>on && weather.has(id)));
       if(!Object.keys(selection).length)throw Error('상세 페이지에서 변이를 하나 이상 켜세요.');
       const {slot,tile}=await standingCrop(job,'지우기'),plantStamp=potPlantStamp(tile);
-      if(!cleanserPlantSelected(tile,catalog,selection,mode)){
-        report(mode==='other'?'선택 변이가 있어 이 작물을 보호했습니다.':'선택 변이가 없어 이 작물은 지우지 않았습니다.');return;
-      }
-      const targets=cleanserTargets(tile,catalog);
-      const preserved=tile.slots.filter(s=>s?.preserved && s.mutations?.some(id=>weather.has(id))).length;
-      if(!targets.length){report(`지울 수 있는 날씨 변이가 없습니다.${preserved?' · 보존된 열매 제외':''} Gold·Rainbow는 유지됩니다.`);return;}
+      const targets=cleanserTargets(tile,catalog,selection,mode);
+      const preserved=tile.slots.filter(s=>s?.preserved && s.mutations?.some(id=>weather.has(id)) && cleanserFruitSelected(s,catalog,selection,mode)).length;
+      if(!targets.length){report(`선택 조건에 맞는 지울 열매가 없습니다.${preserved?' · 보존된 열매 제외':''} Gold·Rainbow는 유지됩니다.`);return;}
       let done=0,skipped=0;
       try {
         for(const target of targets) {
@@ -1291,9 +1289,9 @@
           if(currentStandingSlot()!==slot)throw Error('위치가 바뀌어 중단했습니다.');
           const data=game.data(),current=garden(data)[slot];
           if(potPlantStamp(current)!==plantStamp)throw Error('대상 작물이 바뀌어 중단했습니다.');
-          if(mode==='other' && !cleanserPlantSelected(current,catalog,selection,mode))throw Error('선택 변이가 생겨 남은 열매를 보호했습니다.');
           const fruit=current.slots.find(s=>s?.slotId===target.slotId);
-          if(growSlotStamp(fruit)!==target.stamp || fruit.preserved || !fruit.mutations?.some(id=>weather.has(id))){skipped++;continue;}
+          if(growSlotStamp(fruit)!==target.stamp || fruit.preserved || !fruit.mutations?.some(id=>weather.has(id)) ||
+            !cleanserFruitSelected(fruit,catalog,selection,mode)){skipped++;continue;}
           const plantMeta=catalog.plants?.[current.species]?.plant;
           if(!plantMeta)throw Error('작물 정보 확인 대기');
           if(plantMeta.harvestType!=='Single' && (!finite(current.maturedAt) || current.maturedAt>(game.serverNow() ?? Date.now())))
@@ -1311,7 +1309,7 @@
         }
         checkJob(job);
       }catch(error){throw Error(`변이 지우기 ${done}개 확인 · ${error.message}`);}
-      report(`변이 지우기 완료 · 열매 ${done}개${preserved?` · 보존 ${preserved}개 제외`:''}${skipped?` · 바뀐 열매 ${skipped}개 제외`:''} · Gold·Rainbow 유지`);
+      report(`변이 지우기 완료 · 열매 ${done}개${preserved?` · 보존 ${preserved}개 제외`:''}${skipped?` · 변경·조건 제외 ${skipped}개`:''} · Gold·Rainbow 유지`);
     });
   }
   function potSelection(mode) {
@@ -1504,11 +1502,11 @@
     placePanel();
   }
   function renderCleanse() {
-    content.append(el('p',{text:'서 있는 작물 하나의 모든 열매를 확인합니다. 메뉴의 지우기는 켜 둔 변이가 하나라도 있는 작물만 처리합니다.'}),
-      el('small',{text:'조건에 맞으면 해당 작물의 모든 열매에서 날씨 변이를 지웁니다. 선택하지 않은 날씨 변이도 함께 제거되며, Gold와 Rainbow에는 영향이 없습니다.'}));
-    const actions=el('div',{class:'pot-actions'},button('선택 변이가 있는 작물 지우기',()=>cleanseStanding('selected'),'primary'),button('선택 변이가 없는 작물 지우기',()=>cleanseStanding('other')));
+    content.append(el('p',{text:'서 있는 작물의 열매를 하나씩 판정합니다. 메뉴의 지우기는 켜 둔 변이가 하나라도 포함된 열매만 처리합니다. 다른 열매는 유지됩니다.'}),
+      el('small',{text:'예: Frozen만 켜면 Frozen이 있는 열매의 날씨 변이를 모두 지웁니다. 그 열매의 다른 날씨 변이도 함께 제거되며, Gold와 Rainbow에는 영향이 없습니다.'}));
+    const actions=el('div',{class:'pot-actions'},button('선택 변이가 있는 열매 지우기',()=>cleanseStanding('selected'),'primary'),button('선택 변이가 없는 열매 지우기',()=>cleanseStanding('other')));
     for(const control of actions.querySelectorAll('button'))control.disabled=!!running;
-    content.append(actions,el('small',{text:'제외 버튼은 켜 둔 변이가 하나라도 있으면 작물 전체를 보호합니다. 열매마다 Crop Cleanser 1개 사용 · 보존된 열매 제외'}));
+    content.append(actions,el('small',{text:'제외 버튼은 켜 둔 변이가 포함된 열매를 보호하고, 나머지 열매만 처리합니다. 열매마다 Crop Cleanser 1개 사용 · 보존된 열매 제외'}));
     for(const id of cleanserMutations(catalog)) {
       const name=catalog.mutations?.[id]?.name || id;
       const toggle=switchFor(!!settings.cleanse.selected[id],on=>settings.cleanse.selected[id]=on,`${name} 변이 선택`);
