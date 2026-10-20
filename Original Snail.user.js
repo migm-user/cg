@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.7.0
+// @version      1.7.1
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -30,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.7.0', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.7.1', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -1783,8 +1783,7 @@
       }
       content.append(row(`바로가기 ${index+1}`,fields));
     });
-    const resetRooms=legacy=>{settings.rooms=defaultRooms(legacy);save();refresh(true);report('방 바로가기 기본값 복구 완료');};
-    content.append(button('연화 · KR · KR1 기본값',()=>resetRooms(false)),button('연화 · 체리 · 혜 기본값',()=>resetRooms(true)),el('h3',{text:'펫 프리셋'}));
+    content.append(el('h3',{text:'펫 프리셋'}));
     const teams=teamSnapshot();
     for (const [key,name] of [['hatch','부화 프리셋'],['sell','판매 프리셋'],['restore','종료 후 복구']]) {
       const opts=teamOptions(key,teams),node=select(settings.teams[key],opts,v=>{settings.teams[key]=v;syncTeamControls();},name);
