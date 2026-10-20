@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Snail in Cherry
+// @name         Original Snail
 // @namespace    snail-in-cherry
 // @author       0_"
-// @version      1.6.2
+// @version      1.6.9
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -18,8 +18,8 @@
 // @connect      discord.com
 // @connect      raw.githubusercontent.com
 // @connect      *
-// @updateURL    https://raw.githubusercontent.com/migm-user/cg/main/Snail%20in%20Cherry.user.js
-// @downloadURL  https://raw.githubusercontent.com/migm-user/cg/main/Snail%20in%20Cherry.user.js
+// @updateURL    https://raw.githubusercontent.com/migm-user/cg/main/Original%20Snail.user.js
+// @downloadURL  https://raw.githubusercontent.com/migm-user/cg/main/Original%20Snail.user.js
 // ==/UserScript==
 
 /* Protocol and geometry checked against the supplied Arie's Mod 3.2.217 and
@@ -29,7 +29,8 @@
  * state store, never another mod's saved teams. CommonJS exports are for tests. */
 (function () {
   'use strict';
-  const VERSION = '1.6.2', KEY = 'snail-in-cherry.settings.v1';
+  // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
+  const VERSION = '1.7.0', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -82,19 +83,34 @@
     if(!entry)return {reason:'잠긴 품목 · 인벤토리 유지'};
     return {storage,storageId,held,amount:Math.min(amount,quantity(entry)),itemKey:moveItemKey(entry)};
   }
+  const defaultRooms = legacy => legacy ? [{name:'연화',room:'yeonhwa'},{name:'체리',room:'cherry'},{name:'혜',room:'hye'}] :
+    [{name:'연화',room:'yeonhwa'},{name:'KR',room:'kr'},{name:'KR1',room:'kr1'}];
+  function roomShortcut(raw) {
+    if(!raw || typeof raw.name!=='string' || !raw.name.trim() || raw.name.trim().length>24 || typeof raw.room!=='string')throw Error('방 이름과 표시 이름을 확인하세요.');
+    let room=raw.room.trim();
+    if(/^https?:\/\//i.test(room)) {
+      const url=new URL(room),match=url.pathname.match(/^\/r\/([^/]+)\/?$/);
+      if(url.protocol!=='https:' || url.hostname!=='magicgarden.gg' || url.port || url.username || url.password || url.search || url.hash || !match)throw Error('매직가든 방 링크를 입력하세요.');
+      room=decodeURIComponent(match[1]);
+    }
+    if(!/^[a-z0-9_-]{1,80}$/i.test(room))throw Error('방 이름은 영문·숫자·_·-로 입력하세요.');
+    return {name:raw.name.trim(),room:room.toLowerCase()};
+  }
   const defaults = () => ({
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
     feed: { hungerPotion:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
     pots: { selected: {} },
+    cleanse: { selected: {} }, rooms: defaultRooms(false),
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
     teams: { hatch: '', sell: '', restore: 'current' },
     registeredTeams: [], manualTeamsOpen: false,
     webhook: { enabled: false, url: '' }, position: null, panelPosition: null, collapsedShops: []
   });
-  function settingsFrom(raw) {
+  function settingsFrom(raw,{legacy=false}={}) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw Error('설정 객체가 아닙니다.');
     const s = defaults();
+    if(legacy && !own(raw,'rooms'))s.rooms=defaultRooms(true);
     const bool = (src, key, dst) => {
       if (own(src, key)) {
         if (typeof src[key] !== 'boolean') throw Error(`${key}: On/Off 값이 잘못되었습니다.`);
@@ -102,7 +118,7 @@
       }
     };
     for (const key of ['autoBuy', 'autoStore', 'autoFeed','manualTeamsOpen']) bool(raw, key, s);
-    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed','pots']) {
+    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed','pots','cleanse']) {
       if (own(raw, section) && (!raw[section] || typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw Error(`${section}: 형식 오류`);
     }
     const dict = source => {
@@ -116,6 +132,11 @@
     };
     if (own(raw, 'buy')) s.buy = dict(raw.buy);
     if(own(raw.pots,'selected'))s.pots.selected=dict(raw.pots.selected);
+    if(own(raw.cleanse,'selected'))s.cleanse.selected=dict(raw.cleanse.selected);
+    if(own(raw,'rooms')) {
+      if(!Array.isArray(raw.rooms) || raw.rooms.length!==3)throw Error('방 바로가기는 3개로 설정하세요.');
+      s.rooms=raw.rooms.map(roomShortcut);
+    }
     if(raw.feed) {
       bool(raw.feed,'hungerPotion',s.feed);
       if(own(raw.feed,'allowed'))s.feed.allowed=dict(raw.feed.allowed);
@@ -187,8 +208,8 @@
   function parseSettings(text) {
     if (typeof text !== 'string' || text.length > 1024 * 1024) throw Error('설정 파일은 1MB 이하여야 합니다.');
     const pack = JSON.parse(text);
-    if (pack?.format !== 'Snail in Cherry' || pack.version !== 1) throw Error('지원하는 Snail in Cherry 설정 파일이 아닙니다.');
-    return settingsFrom(pack.settings);
+    if (!['Original Snail','Snail in Cherry'].includes(pack?.format) || pack.version !== 1) throw Error('지원하는 Original Snail 설정 파일이 아닙니다.');
+    return settingsFrom(pack.settings,{legacy:pack.format==='Snail in Cherry'});
   }
   function webhookURL(text) {
     const u = new URL(text);
@@ -391,6 +412,12 @@
       ids.add(slot.slotId);return true;
     }).map(slot=>({slotId:slot.slotId,stamp:growSlotStamp(slot)}));
   }
+  function cleanserPlantSelected(tile,catalog,selection,mode='selected') {
+    const weather=cleanserMutations(catalog),chosen=Object.keys(selection).filter(id=>selection[id] && weather.has(id));
+    if(!isPotPlant(tile) || !chosen.length)return false;
+    const matches=tile.slots.some(fruit=>fruit?.mutations?.some(id=>chosen.includes(id)));
+    return mode==='other'?!matches:matches;
+  }
   const cleanserCount=data=>(data.inventory?.items || []).reduce((n,item)=>n+(item?.itemType==='Tool' && item.toolId==='CropCleanser'?quantity(item):0),0);
   function cleanserAvailable(data) {
     const first=(data.inventory?.items || []).find(item=>item?.itemType==='Tool' && item.toolId==='CropCleanser' && quantity(item)>0);
@@ -525,6 +552,19 @@
   const foodKey = (species,type,id) => `${species}:${type}:${id}`;
   const foodAllowed = (settings,species,type,id) =>
     !(type==='Tool' && id==='ReplenishPotion' && settings.feed.hungerPotion===false) && settings.feed.allowed[foodKey(species,type,id)]!==false;
+  function feedChoiceKeys(catalog,type) {
+    return Object.entries(catalog.pets || {}).flatMap(([species,pet])=>type==='potion'?[foodKey(species,'Tool','ReplenishPotion')]:
+      [...new Set(Array.isArray(pet.diet)?pet.diet:[])].map(id=>foodKey(species,'Produce',id)));
+  }
+  function feedBulkState(settings,catalog,type) {
+    const keys=feedChoiceKeys(catalog,type);
+    if(!keys.length)return 'empty';
+    const count=keys.filter(key=>settings.feed.allowed[key]!==false).length;
+    return count===keys.length?'on':count===0?'off':'mixed';
+  }
+  function setFeedChoices(settings,catalog,type,on) {
+    for(const key of feedChoiceKeys(catalog,type))settings.feed.allowed[key]=on;
+  }
   function chooseFood(data,pet,catalog,settings) {
     const diet=catalog.pets?.[pet.petSpecies]?.diet;
     if(!Array.isArray(diet))return null;
@@ -751,13 +791,18 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
+  const exported = { defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserPlantSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood,petPosition };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
   page.__SNAIL_IN_CHERRY__ = VERSION;
+  page.__ORIGINAL_SNAIL__ = VERSION;
   let settings;
-  try { settings = settingsFrom(GM_getValue(KEY,defaults())); } catch { settings = defaults(); }
+  try {
+    const saved=GM_getValue(KEY,null),previousCatalog=GM_getValue('snail-in-cherry.catalog.v1',null);
+    settings=saved==null?(previousCatalog?settingsFrom({},{legacy:true}):defaults()):settingsFrom(saved,{legacy:true});
+    GM_setValue(KEY,settings);
+  } catch { settings = defaults(); }
   let catalog = {}, catalogAt = 0, catalogPromise = null, catalogRetryAt = 0, catalogETag = '', running = null, status = '게임 연결 대기', view = 'home';
   let liveInfo={},liveAt=0,livePromise=null,liveRetryAt=0,homePage=0;
   const skinsAPI=()=>page.__SNAIL_WITH_SKINS__;
@@ -939,19 +984,19 @@
     const image = sprite(type,id);
     const embed = { title: confirmed === sent && !reason ? '🛒 구매 완료' : '🛒 구매 결과',
       description: `${title(type,id)}\n구매 성공 재고 ${confirmed}/${sent}${reason ? `\n${reason}` : ''}`,
-      color: reason ? 0xf0ad4e : 0xb34465, footer: { text: 'Snail in Cherry' }, timestamp: new Date().toISOString() };
+      color: reason ? 0xf0ad4e : 0xb34465, footer: { text: 'Original Snail' }, timestamp: new Date().toISOString() };
     if (image) embed.thumbnail = { url: image };
     sendWebhook(settings.webhook,embed);
   }
   function notifyFeed(pet,event,detail) {
-    const embed={title:`🍽️ ${event}`,description:`${pet.name || title('Pet',pet.petSpecies)}\n${detail}`,color:0x67987b,footer:{text:'Snail in Cherry'},timestamp:new Date().toISOString()};
+    const embed={title:`🍽️ ${event}`,description:`${pet.name || title('Pet',pet.petSpecies)}\n${detail}`,color:0x67987b,footer:{text:'Original Snail'},timestamp:new Date().toISOString()};
     const image=sprite('Pet',pet.petSpecies);if(image)embed.thumbnail={url:image};
     sendWebhook(settings.feed.webhook,embed);
   }
   function sendWebhook(hook,embed) {
     if(!hook.enabled || !hook.url)return;
     const url=webhookURL(hook.url);
-    const body = JSON.stringify({ username: 'Snail in Cherry', allowed_mentions: { parse: [] }, embeds: [embed] });
+    const body = JSON.stringify({ username: 'Original Snail', allowed_mentions: { parse: [] }, embeds: [embed] });
     webhookQueue = webhookQueue.then(async () => {
       for (let attempt=0; attempt<3; attempt++) {
         const response = await request(url,{ method:'POST',body });
@@ -1227,11 +1272,16 @@
       report(done?'화분 담기 완료 · 1개':'대상 작물이 바뀌어 담지 않았습니다.');
     });
   }
-  function cleanseStanding() {
+  function cleanseStanding(mode='selected') {
     void run('cleanse',async job=> {
       await loadCatalog();checkJob(job);
+      const weather=cleanserMutations(catalog),selection=Object.fromEntries(Object.entries(settings.cleanse.selected).filter(([id,on])=>on && weather.has(id)));
+      if(!Object.keys(selection).length)throw Error('상세 페이지에서 변이를 하나 이상 켜세요.');
       const {slot,tile}=await standingCrop(job,'지우기'),plantStamp=potPlantStamp(tile);
-      const weather=cleanserMutations(catalog),targets=cleanserTargets(tile,catalog);
+      if(!cleanserPlantSelected(tile,catalog,selection,mode)){
+        report(mode==='other'?'선택 변이가 있어 이 작물을 보호했습니다.':'선택 변이가 없어 이 작물은 지우지 않았습니다.');return;
+      }
+      const targets=cleanserTargets(tile,catalog);
       const preserved=tile.slots.filter(s=>s?.preserved && s.mutations?.some(id=>weather.has(id))).length;
       if(!targets.length){report(`지울 수 있는 날씨 변이가 없습니다.${preserved?' · 보존된 열매 제외':''} Gold·Rainbow는 유지됩니다.`);return;}
       let done=0,skipped=0;
@@ -1241,6 +1291,7 @@
           if(currentStandingSlot()!==slot)throw Error('위치가 바뀌어 중단했습니다.');
           const data=game.data(),current=garden(data)[slot];
           if(potPlantStamp(current)!==plantStamp)throw Error('대상 작물이 바뀌어 중단했습니다.');
+          if(mode==='other' && !cleanserPlantSelected(current,catalog,selection,mode))throw Error('선택 변이가 생겨 남은 열매를 보호했습니다.');
           const fruit=current.slots.find(s=>s?.slotId===target.slotId);
           if(growSlotStamp(fruit)!==target.stamp || fruit.preserved || !fruit.mutations?.some(id=>weather.has(id))){skipped++;continue;}
           const plantMeta=catalog.plants?.[current.species]?.plant;
@@ -1432,10 +1483,9 @@
       if(homePage===1)content.append(el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),
         switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')),
         el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')),
-        el('div',{class:'menu-row'},button('🫧 변이 지우기',()=>go('cleanse'),'menu-link'),button('지우기',cleanseStanding,'pill')));
-      content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...[
-        ['연화','Yeonhwa'],['채리','Cherry'],['혜','Hye']
-      ].map(([name,room])=>el('a',{text:name,href:`https://magicgarden.gg/r/${room.toLowerCase()}`,title:`${room} 방으로 이동`} ))));
+        el('div',{class:'menu-row'},button('🫧 변이 지우기',()=>go('cleanse'),'menu-link'),button('지우기',()=>cleanseStanding('selected'),'pill')));
+      content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...settings.rooms.map(({name,room})=>
+        el('a',{text:name,href:`https://magicgarden.gg/r/${room}`,title:`${room} 방으로 이동`} ))));
       const previous=button('◀',()=>{homePage=0;refresh(true);});previous.setAttribute('aria-label','이전 메뉴 페이지');previous.disabled=homePage===0;
       const next=button('▶',()=>{homePage=1;refresh(true);});next.setAttribute('aria-label','다음 메뉴 페이지');next.disabled=homePage===1;
       content.append(el('nav',{class:'menu-pages',ariaLabel:'메뉴 페이지 전환'},previous,el('span',{text:`${homePage+1} / 2`}),next));
@@ -1447,14 +1497,24 @@
       if (view==='sell') renderSell();
       if (view==='feed') renderFeed();
       if (view==='pot') renderPot();
-      if (view==='cleanse') content.append(
-        el('p',{text:'메뉴의 지우기 버튼을 누르면 서 있는 자리에 있는 작물의 모든 열매에 Crop Cleanser를 사용해 날씨 변이를 지웁니다.'}),
-        el('p',{text:'Gold와 Rainbow에는 영향이 없습니다.'}),
-        el('small',{text:'열매마다 Crop Cleanser 1개를 사용합니다. 보존된 열매는 제외하며, 이동·세정제 부족·잠금 시에는 중단합니다.'}));
+      if (view==='cleanse') renderCleanse();
       if (view==='settings') renderSettings();
     }
     if(footer.textContent!==status)footer.textContent=status;
     placePanel();
+  }
+  function renderCleanse() {
+    content.append(el('p',{text:'서 있는 작물 하나의 모든 열매를 확인합니다. 메뉴의 지우기는 켜 둔 변이가 하나라도 있는 작물만 처리합니다.'}),
+      el('small',{text:'조건에 맞으면 해당 작물의 모든 열매에서 날씨 변이를 지웁니다. 선택하지 않은 날씨 변이도 함께 제거되며, Gold와 Rainbow에는 영향이 없습니다.'}));
+    const actions=el('div',{class:'pot-actions'},button('선택 변이가 있는 작물 지우기',()=>cleanseStanding('selected'),'primary'),button('선택 변이가 없는 작물 지우기',()=>cleanseStanding('other')));
+    for(const control of actions.querySelectorAll('button'))control.disabled=!!running;
+    content.append(actions,el('small',{text:'제외 버튼은 켜 둔 변이가 하나라도 있으면 작물 전체를 보호합니다. 열매마다 Crop Cleanser 1개 사용 · 보존된 열매 제외'}));
+    for(const id of cleanserMutations(catalog)) {
+      const name=catalog.mutations?.[id]?.name || id;
+      const toggle=switchFor(!!settings.cleanse.selected[id],on=>settings.cleanse.selected[id]=on,`${name} 변이 선택`);
+      toggle.querySelector('input').disabled=!!running;
+      content.append(row(name,toggle));
+    }
   }
   function renderPot() {
     let data=null;try{data=game.data();}catch{}
@@ -1574,6 +1634,16 @@
       },'Hunger Potion 전체 허용'),'Off이면 모든 동물에게 포션 지급 제외 · 개별 선택 유지'),
       el('small',{text:'알림 후 1~5초 대기 · 여러 펫은 2초 간격 · 일반 먹이 우선, 허용한 포션만 사용'}),
       el('small',{text:'선택한 먹이만 잠금 해제하고, 남아 있으면 다시 잠급니다.'}));
+    const bulk=el('div',{class:'feed-bulk'});
+    for(const [type,label] of [['potion','Hunger Potion'],['produce','작물 먹이']]) {
+      const state=feedBulkState(settings,catalog,type),text=state==='mixed'?`${label} 개별 적용`:`모든 ${label} ${state==='off'?'꺼짐':'켜짐'}`;
+      const control=button(text,()=>{
+        const on=feedBulkState(settings,catalog,type)!=='on';setFeedChoices(settings,catalog,type,on);save();observeFeed();refresh(true);
+        report(`${label} 펫별 선택을 모두 ${on?'켰습니다.':'껐습니다.'}${type==='potion' && !settings.feed.hungerPotion?' · 전체 허용 Off로 포션 급식은 차단 중':''}`);
+      });
+      control.dataset.feedBulk=type;control.disabled=state==='empty';bulk.append(control);
+    }
+    content.append(bulk,el('small',{text:'버튼은 모든 펫의 선택을 변경합니다. 개별 적용에서 누르면 모두 켜집니다. 포션 전체 허용 Off이면 펫별 선택과 관계없이 포션을 주지 않습니다.'}));
     const groups=petFoodGroups(catalog);
     if(!groups.length)content.append(el('p',{text:'동물과 먹이 정보를 불러오는 중입니다.'}));
     function folded(key,id,label,className) {
@@ -1596,7 +1666,7 @@
         for(const [type,id] of [...diet.map(id=>['Produce',id]),['Tool','ReplenishPotion']]) {
           const key=foodKey(species,type,id);
           const toggle=switchFor(foodAllowed(settings,species,type,id),v=>{
-            settings.feed.allowed[key]=v;observeFeed();
+            settings.feed.allowed[key]=v;observeFeed();syncFeedBulk();
           },`${title('Pet',species)} · ${title(type,id)} 먹이`);
           if(type==='Tool' && id==='ReplenishPotion' && !settings.feed.hungerPotion)toggle.querySelector('input').disabled=true;
           animal.append(el('div',{class:'row'},itemLabel(type,id,''),toggle));
@@ -1610,6 +1680,12 @@
         try{const value=e.target.value.trim();if(value)webhookURL(value);settings.feed.webhook.url=value;save();report('펫 먹이 웹후크 주소 저장됨');}
         catch(error){report(error.message);e.target.value=settings.feed.webhook.url;}
       }}));
+  }
+  function syncFeedBulk() {
+    for(const button of content.querySelectorAll('button[data-feed-bulk]')) {
+      const type=button.dataset.feedBulk,label=type==='potion'?'Hunger Potion':'작물 먹이',state=feedBulkState(settings,catalog,type);
+      button.textContent=state==='mixed'?`${label} 개별 적용`:`모든 ${label} ${state==='off'?'꺼짐':'켜짐'}`;button.disabled=state==='empty';
+    }
   }
   function teamSnapshot() {
     if(game.socket && game.socket.readyState!==1)return null;
@@ -1695,6 +1771,20 @@
     details.append(body);return details;
   }
   function renderSettings() {
+    content.append(el('h3',{text:'방 바로가기'}),el('small',{text:'표시 이름과 방 이름 또는 매직가든 방 링크를 입력하세요. 세 개의 바로가기에 바로 반영됩니다.'}));
+    settings.rooms.forEach((shortcut,index)=>{
+      const fields=el('div',{class:'room-fields'});
+      for(const [key,label] of [['name','표시 이름'],['room','방 이름 또는 링크']]) {
+        const input=el('input',{type:'text',value:shortcut[key],maxLength:key==='name'?24:200,ariaLabel:`바로가기 ${index+1} ${label}`,placeholder:label});
+        input.addEventListener('change',()=>{
+          try{settings.rooms[index]=roomShortcut({...settings.rooms[index],[key]:input.value});input.value=settings.rooms[index][key];save();report(`바로가기 ${index+1} 저장됨`);}
+          catch(error){input.value=settings.rooms[index][key];report(error.message);}
+        });fields.append(input);
+      }
+      content.append(row(`바로가기 ${index+1}`,fields));
+    });
+    const resetRooms=legacy=>{settings.rooms=defaultRooms(legacy);save();refresh(true);report('방 바로가기 기본값 복구 완료');};
+    content.append(button('연화 · KR · KR1 기본값',()=>resetRooms(false)),button('연화 · 체리 · 혜 기본값',()=>resetRooms(true)),el('h3',{text:'펫 프리셋'}));
     const teams=teamSnapshot();
     for (const [key,name] of [['hatch','부화 프리셋'],['sell','판매 프리셋'],['restore','종료 후 복구']]) {
       const opts=teamOptions(key,teams),node=select(settings.teams[key],opts,v=>{settings.teams[key]=v;syncTeamControls();},name);
@@ -1719,12 +1809,12 @@
           const res=await request(link.href);if(res.status!==200)throw Error(`설정 다운로드 실패 (${res.status})`);
           importSettings(res.responseText);
         }catch(error){report(error.message);}
-      }),el('small',{text:'로그인 없이 JSON을 직접 내려주는 링크를 사용하세요.'}),el('h3',{text:'최근 상태'}),el('pre',{text:log.slice(0,12).join('\n')||'아직 기록이 없습니다.'}),el('small',{text:`Snail in Cherry ${VERSION} · 0_"`}));
+      }),el('small',{text:'로그인 없이 JSON을 직접 내려주는 링크를 사용하세요.'}),el('h3',{text:'최근 상태'}),el('pre',{text:log.slice(0,12).join('\n')||'아직 기록이 없습니다.'}),el('small',{text:`Original Snail ${VERSION} · 0_"`}));
   }
   function exportSettings() {
-    const text=JSON.stringify({format:'Snail in Cherry',version:1,scriptVersion:VERSION,settings},null,2);
+    const text=JSON.stringify({format:'Original Snail',version:1,scriptVersion:VERSION,settings},null,2);
     const url=URL.createObjectURL(new Blob([text],{type:'application/json'}));
-    const a=el('a',{href:url,download:`Snail-in-Cherry-settings-${new Date().toISOString().slice(0,10)}.json`});
+    const a=el('a',{href:url,download:`Original-Snail-settings-${new Date().toISOString().slice(0,10)}.json`});
     shadow.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);report('설정 파일 저장 완료');
   }
   function importSettings(text) {
@@ -1796,13 +1886,14 @@
       .rooms{display:flex;gap:6px;padding-top:8px;margin-top:5px;border-top:1px solid #ffffff16}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
       .menu-pages{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid #ffffff16;margin-top:8px;padding-top:8px}.menu-pages button{padding:3px 13px}.menu-pages span{font-size:11px;color:#a7b7ad}.menu-pages button:disabled{opacity:.35;cursor:default}
       .pot-actions{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}.pot-actions button{flex:1;padding:6px 4px;white-space:nowrap}.pot-crop input{accent-color:#6caf84;flex:none;margin:0 3px}
+      .feed-bulk{display:flex;flex-direction:column;gap:5px;margin:7px 0}.feed-bulk button{text-align:left}.room-fields{display:flex;flex-direction:column;gap:4px;width:175px;max-width:65%}.room-fields input{width:100%}
       .feed-pet{border-top:1px solid #ffffff14}.feed-pet>summary{padding:7px 0;background:none}.feed-pet>summary .item{min-width:0}.feed-pet>.row{padding:5px 0 5px 10px}.feed-pet>.row small:empty{display:none}
       .switch{display:inline-flex;flex:none;position:relative;width:35px;height:21px;cursor:pointer}.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.switch span{width:35px;height:21px;border-radius:12px;background:#ffffff24;pointer-events:none}.switch span:after{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#d7dedb;margin:3px;transition:transform .15s}.switch input:checked+span{background:#498060}.switch input:checked+span:after{transform:translateX(14px);background:#f1fff6}.switch input:focus-visible+span{outline:2px solid #6caf84;outline-offset:3px}
       select,input:not([type=checkbox]){background:#161d1acc;border:1px solid #ffffff26;border-radius:4px;padding:5px;max-width:100%;min-width:0}select option{background:#252e29;color:#e5e8e9}.row select{max-width:175px}.row input[type=number]{width:84px}.body>input{width:100%;margin:8px 0}.body>button{margin:6px 5px 3px 0}.primary{background:#3e664b;border-color:#6a9876;color:#f2fff6}.primary:hover{background:#4a775a}.item{display:flex;align-items:center;gap:9px;flex:1;min-width:0}.item img,.fallback{width:25px;height:25px;object-fit:contain;image-rendering:pixelated;flex:none}.fallback{text-align:center;line-height:25px}.grip{color:#88998f;cursor:grab;user-select:none}.arrows{display:flex;flex-direction:column;gap:2px}.arrows button{font-size:10px;padding:0 5px;border-radius:4px}
       .shop-category{margin-top:7px;border:1px solid #ffffff1b;border-radius:5px;overflow:hidden}.shop-category summary{cursor:pointer;display:flex;align-items:center;gap:7px;padding:7px 8px;background:#ffffff05;list-style:none;font-weight:600;user-select:none}.shop-category summary::-webkit-details-marker{display:none}.shop-category summary:before{content:'›';font-size:17px;line-height:1;color:#9eaea4;transition:transform .12s}.shop-category[open]>summary:before,.feed-pet[open]>summary:before{transform:rotate(90deg)}.shop-category summary small{margin:0 0 0 auto;font-size:10px;font-weight:400}.category-body{padding:0 8px}.category-body .row:last-child{border-bottom:0}
       .summary{padding:8px;background:#ffffff08;border:1px solid #ffffff13;border-radius:5px;margin:8px 0}footer{padding:6px 10px;border-top:1px solid #ffffff16;font-size:10px;color:#a7b7ad;background:#00000012;overflow-wrap:anywhere;flex:none;max-height:75px;overflow:auto}pre{white-space:pre-wrap;font-size:10px;line-height:1.8;color:#99aaa0;max-height:160px;overflow:auto}.overlay{position:fixed;inset:0;background:#10171299;display:grid;place-items:center;z-index:2147483646}.dialog{background:#262e28;border:1px solid #ffffff24;border-radius:8px;padding:15px;width:370px;max-width:calc(100vw - 24px);box-shadow:0 20px 80px #0007}.dialog ul{max-height:200px;overflow:auto;padding-left:20px}.actions{display:flex;justify-content:flex-end;gap:8px}@media(max-width:520px){.panel{max-height:calc(100dvh - 16px)}.body{padding:0 10px 9px}.row select{max-width:170px}}
     `});
-    icon=button('🐌',()=>{panel.hidden=!panel.hidden;if(!panel.hidden)refresh();},'icon');icon.setAttribute('aria-label','Snail in Cherry 열기');
+    icon=button('🐌',()=>{panel.hidden=!panel.hidden;if(!panel.hidden)refresh();},'icon');icon.setAttribute('aria-label','Original Snail 열기');
     icon.onclick=null;
     // Pointer drag and click are separated with the Floating Bell's 4px threshold.
     let drag=null,suppressClick=false;
@@ -1812,8 +1903,8 @@
     const endDrag=e=>{if(!drag)return;suppressClick=drag.moved;if(drag.moved){const r=icon.getBoundingClientRect();settings.position={left:r.left,top:r.top};save();}drag=null;if(icon.hasPointerCapture(e.pointerId))icon.releasePointerCapture(e.pointerId);};
     icon.addEventListener('pointerup',endDrag);icon.addEventListener('pointercancel',endDrag);
     content=el('main',{class:'body'});footer=el('footer',{role:'status','ariaLive':'polite',text:status});
-    panel=el('section',{class:'panel',hidden:true,ariaLabel:'Snail in Cherry'},el('header',{},
-      el('div',{class:'brand'},el('strong',{text:'Snail in Cherry',class:'title-handle',title:'드래그하여 창 이동'}),button('×',()=>panel.hidden=true)),
+    panel=el('section',{class:'panel',hidden:true,ariaLabel:'Original Snail'},el('header',{},
+      el('div',{class:'brand'},el('strong',{text:'Original Snail',class:'title-handle',title:'드래그하여 창 이동'}),button('×',()=>panel.hidden=true)),
       el('div',{class:'badges'},el('span',{class:'connection',text:'○ 연결 대기'}),el('span',{class:'version',text:VERSION})),
       el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}))),content,footer,
       button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed')setAutoFeed(false);if(running.kind==='buy')setAutoBuy(false);save();}report('현재 요청 확인 후 중지합니다.');},'stop'));
