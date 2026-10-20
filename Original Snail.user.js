@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Original Snail
-// @namespace    snail-in-cherry
+// @namespace    Original Snail
 // @author       0_"
 // @version      1.7.3
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·스킨과 설정 백업
@@ -17,7 +17,6 @@
 // @connect      mg-api.ariedam.fr
 // @connect      discord.com
 // @connect      raw.githubusercontent.com
-// @connect      *
 // @updateURL    https://raw.githubusercontent.com/migm-user/cg/main/Original%20Snail.user.js
 // @downloadURL  https://raw.githubusercontent.com/migm-user/cg/main/Original%20Snail.user.js
 // ==/UserScript==
