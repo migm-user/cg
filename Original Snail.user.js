@@ -2,8 +2,8 @@
 // @name         Original Snail
 // @namespace    Original Snail
 // @author       0_"
-// @version      1.7.3
-// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·스킨과 설정 백업
+// @version      1.8.0
+// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -29,7 +29,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.7.3', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.8.0', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -99,6 +99,7 @@
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
     feed: { potionDefault:true,allowLockedPotions:true,allowLockedCrops:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
+    cropManager: {iconVisible:false,iconPosition:null,minSize:100,selected:{},conditions:{...FRUIT_MONITOR_CONDITION_DEFAULTS},cropsOpen:false,goalsOpen:false},
     pots: { selected: {} },
     cleanse: { selected: {} }, rooms: defaultRooms(false),
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
@@ -117,7 +118,7 @@
       }
     };
     for (const key of ['autoBuy', 'autoStore', 'autoFeed','manualTeamsOpen']) bool(raw, key, s);
-    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed','pots','cleanse']) {
+    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed','pots','cleanse','cropManager']) {
       if (own(raw, section) && (!raw[section] || typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw Error(`${section}: 형식 오류`);
     }
     const dict = source => {
@@ -129,6 +130,24 @@
       }
       return result;
     };
+    if(raw.cropManager) {
+      const source=raw.cropManager,target=s.cropManager;
+      for(const key of ['iconVisible','cropsOpen','goalsOpen'])bool(source,key,target);
+      if(own(source,'selected'))target.selected=dict(source.selected);
+      if(own(source,'conditions')) {
+        const values=dict(source.conditions);
+        if(Object.keys(values).some(key=>!own(FRUIT_MONITOR_CONDITION_DEFAULTS,key)))throw Error('작물 완료 조건 오류');
+        target.conditions={...target.conditions,...values};
+      }
+      if(own(source,'minSize')) {
+        if(!Number.isInteger(source.minSize)||source.minSize<50||source.minSize>100)throw Error('완료 크기는 50~100 정수로 입력하세요.');
+        target.minSize=source.minSize;
+      }
+      if(source.iconPosition!=null) {
+        if(!finite(source.iconPosition.left)||!finite(source.iconPosition.top))throw Error('작물 관리 아이콘 위치 오류');
+        target.iconPosition={left:source.iconPosition.left,top:source.iconPosition.top};
+      }
+    }
     if (own(raw, 'buy')) s.buy = dict(raw.buy);
     if(own(raw.pots,'selected'))s.pots.selected=dict(raw.pots.selected);
     if(own(raw.cleanse,'selected'))s.cleanse.selected=dict(raw.cleanse.selected);
@@ -384,6 +403,37 @@
     return [...groups.values()].sort((a,b)=>rank(a.entry)-rank(b.entry) ||
       (finite(a.entry.seed.coinPrice)?a.entry.seed.coinPrice:Infinity)-(finite(b.entry.seed.coinPrice)?b.entry.seed.coinPrice:Infinity) || a.index-b.index);
   }
+  // Cache immutable catalog order. Inventory and garden patches do not rebuild it.
+  const journalOrderCache=new WeakMap();
+  function journalOrder(catalog,type,ids) {
+    let cache=journalOrderCache.get(catalog);if(!cache){cache={};journalOrderCache.set(catalog,cache);}
+    if(!cache[type]) {
+      let ordered;
+      if(type==='Seed'||type==='Produce')ordered=journalPlants(catalog).flatMap(({id,aliases})=>[id,...aliases]);
+      else {
+        const source=catalog[({Egg:'eggs',Pet:'pets',Tool:'items',Decor:'decor'})[type]] || {};
+        const rarities=(catalog.enums?.rarity || ['Common','Uncommon','Rare','Legendary','Mythical','Divine','Celestial']).map(v=>v==='Mythic'?'Mythical':v);
+        const rank=id=>{const i=rarities.indexOf(source[id].rarity==='Mythic'?'Mythical':source[id].rarity);return i<0?Infinity:i;};
+        ordered=Object.keys(source).sort((a,b)=>rank(a)-rank(b)||(source[a].coinPrice??Infinity)-(source[b].coinPrice??Infinity));
+      }
+      cache[type]=new Map(ordered.map((id,index)=>[id,index]));
+    }
+    const ranks=cache[type];return [...new Set(ids)].sort((a,b)=>(ranks.get(a)??Infinity)-(ranks.get(b)??Infinity)||a.localeCompare(b));
+  }
+  function inventoryCropGroups(inventory,catalog) {
+    const groups=new Map();
+    for(const item of inventory?.items || []) {
+      if(item?.itemType!=='Produce'||typeof item.species!=='string')continue;
+      if(!groups.has(item.species))groups.set(item.species,{id:item.species,items:[],locked:0,invalid:0});
+      const group=groups.get(item.species);group.items.push(item);
+      if(foodLocked(inventory,item))group.locked++;
+      if(typeof item.id!=='string'||!item.id)group.invalid++;
+    }
+    return journalOrder(catalog,'Produce',[...groups.keys()]).map(id=>{
+      const group=groups.get(id);return {...group,state:group.locked===group.items.length?'locked':group.locked===0?'unlocked':'mixed'};
+    });
+  }
+
   // Same six-plot DirtTiles geometry verified against the official v1634 map.
   // Prefer the actual game map when available; do not guess a cell on a boardwalk.
   function potTilePosition(slotIndex,localIndex) {
@@ -597,6 +647,106 @@
   const foodLockKey=(inventory,item)=>item?.itemType==='Tool' && inventory.favoritedItemIds?.includes(item.toolId)?item.toolId:
     (typeof item?.id==='string' && item.id?item.id:item?.itemType==='Tool'?item.toolId:null);
 
+  // Read-only fruit goals. Display names differ from the server mutation IDs.
+  const FRUIT_MUTATION_NAMES={Gold:'Gold',Rainbow:'Rainbow',Wet:'Wet',Chilled:'Chilled',Frozen:'Frozen',Thunderstruck:'Thunderstruck',Thundercharged:'Thundercharged',Dawnlit:'Dawnlit',Dawncharged:'Dawnbound',Ambershine:'Amberlit',Ambercharged:'Amberbound'};
+  const FRUIT_MUTATION_ALIASES={Amberlit:'Ambershine',Amberbound:'Ambercharged',Dawnbound:'Dawncharged'};
+  const FRUIT_MUTATION_GROUPS=[['Gold','Rainbow'],['Wet','Chilled','Frozen','Thunderstruck','Thundercharged'],['Dawnlit','Dawncharged','Ambershine','Ambercharged']];
+  const FRUIT_MONITOR_CONDITION_DEFAULTS={Rainbow:true,Gold:true,Thundercharged:true,Thunderstruck:true,Wet:false,Chilled:false,Frozen:false,Ambercharged:true,Ambershine:true,Dawncharged:false,Dawnlit:false,size100:true};
+  const FRUIT_MUTATION_UPGRADES={Wet:['Wet','Frozen'],Chilled:['Chilled','Frozen'],Frozen:['Frozen'],Thunderstruck:['Thunderstruck','Thundercharged'],Thundercharged:['Thundercharged'],Dawnlit:['Dawnlit','Dawncharged'],Dawncharged:['Dawncharged'],Ambershine:['Ambershine','Ambercharged'],Ambercharged:['Ambercharged']};
+  function fruitMonitorCardPlan(conditions){
+    const goal=fruitMonitorConditions(conditions),include=group=>group.filter(id=>goal[id]||group.some(target=>goal[target]&&FRUIT_MUTATION_UPGRADES[id]?.includes(target)));
+    const weather=include(['Thundercharged','Thunderstruck','Frozen','Chilled','Wet']),lunar=include(['Dawncharged','Dawnlit','Ambercharged','Ambershine']);
+    const dawn=lunar.some(id=>id.startsWith('Dawn')),amber=lunar.some(id=>id.startsWith('Amber'));
+    return {color:['Rainbow','Gold'].filter(id=>goal[id]),weather,lunar,lunarFamily:dawn&&amber?'lunar':dawn?'dawn':'amber',size:goal.size100};
+  }
+  function fruitMonitorConditions(value){return {...FRUIT_MONITOR_CONDITION_DEFAULTS,...value};}
+  function fruitMonitorSpeciesName(id,catalog={}){return catalog.plants?.[id]?.name||catalog.plants?.[id]?.plant?.name||({Starweaver:'Starweaver',DawnCelestial:'Dawnbinder',MoonCelestial:'Moonbinder'})[id]||id;}
+  function inspectFruit(fruit,tileIndex,index,parentSpecies,now,conditions,minSize=100) {
+    const species=typeof fruit.species==='string'&&fruit.species?fruit.species:parentSpecies;
+    const validMutationArray=Array.isArray(fruit.mutations)&&fruit.mutations.every(id=>typeof id==='string');
+    const raw=validMutationArray?fruit.mutations:[],mutations=[...new Set(raw.map(id=>FRUIT_MUTATION_ALIASES[id]||id))];
+    const unknownMutation=mutations.some(id=>!Object.hasOwn(FRUIT_MUTATION_NAMES,id));
+    const inconsistent=FRUIT_MUTATION_GROUPS.some(group=>mutations.filter(id=>group.includes(id)).length>1);
+    const mutationKnown=validMutationArray&&!unknownMutation&&!inconsistent;
+    const sizeKnown=typeof fruit.size==='number'&&Number.isFinite(fruit.size)&&fruit.size>=50&&fruit.size<=100;
+    minSize=Number.isInteger(minSize)&&minSize>=50&&minSize<=100?minSize:100;
+    const has=id=>mutationKnown&&mutations.includes(id),size100=sizeKnown&&fruit.size===100,sizeSatisfied=sizeKnown&&fruit.size>=minSize;
+    const goal=fruitMonitorConditions(conditions),colorChecked=goal.Rainbow||goal.Gold,thunderChecked=goal.Thundercharged||goal.Thunderstruck||goal.Wet||goal.Chilled||goal.Frozen,amberChecked=goal.Ambercharged||goal.Ambershine||goal.Dawncharged||goal.Dawnlit;
+    // Directed upgrades: lower-tier mutations are not cleanser targets if an allowed upgrade is reachable.
+    const reachable=FRUIT_MUTATION_UPGRADES;
+    const hydro=mutations.find(id=>FRUIT_MUTATION_GROUPS[1].includes(id)),lunar=mutations.find(id=>FRUIT_MUTATION_GROUPS[2].includes(id));
+    const thunderConflict=!!(mutationKnown&&thunderChecked&&hydro&&!reachable[hydro].some(id=>goal[id]));
+    const amberConflict=!!(mutationKnown&&amberChecked&&lunar&&!reachable[lunar].some(id=>goal[id]));
+    const thunderCleanser=thunderConflict&&fruit.preserved!==true,amberCleanser=amberConflict&&fruit.preserved!==true;
+    const conflicts=[...(thunderConflict?[hydro]:[]),...(amberConflict?[lunar]:[])];
+    const rainbow=has('Rainbow'),struck=has('Thunderstruck'),charged=has('Thundercharged'),amberlit=has('Ambershine'),amberbound=has('Ambercharged');
+    const colorSatisfied=!colorChecked||!!(goal.Rainbow&&rainbow||goal.Gold&&has('Gold'));
+    const thunderSatisfied=!thunderChecked||!!(goal.Thundercharged&&charged||goal.Thunderstruck&&struck||goal.Wet&&has('Wet')||goal.Chilled&&has('Chilled')||goal.Frozen&&has('Frozen'));
+    // Dawn and Amber are alternative routes within the same mutually exclusive lunar group.
+    const amberSatisfied=!amberChecked||!!(goal.Ambercharged&&amberbound||goal.Ambershine&&amberlit||goal.Dawncharged&&has('Dawncharged')||goal.Dawnlit&&has('Dawnlit'));
+    const unknown=(colorChecked||thunderChecked||amberChecked)&&!mutationKnown||goal.size100&&!sizeKnown||typeof fruit.species!=='string'||!fruit.species;
+    const hasGoal=colorChecked||thunderChecked||amberChecked||goal.size100;
+    const basic=!!hasGoal&&!unknown&&colorSatisfied&&thunderSatisfied&&amberSatisfied&&(!goal.size100||sizeSatisfied),advanced=basic&&(!thunderChecked||!reachable[hydro]?.some(id=>id!==hydro&&goal[id]))&&(!amberChecked||!reachable[lunar]?.some(id=>id!==lunar&&goal[id]));
+    const timeKnown=typeof fruit.endTime==='number'&&Number.isFinite(fruit.endTime)&&typeof now==='number'&&Number.isFinite(now);
+    const issues=[];
+    if(!mutationKnown)issues.push('변이 정보 확인 필요');
+    else {
+      if(colorChecked&&!colorSatisfied)issues.push(has('Gold')?'Gold · 선택 색 조건 미달':'선택 색 변이 없음');
+      if(thunderChecked&&!hydro)issues.push('선택 기상 변이 없음');
+      if(amberChecked&&!lunar)issues.push('선택 달 변이 없음');
+      if(conflicts.length)issues.push('충돌: '+conflicts.map(id=>FRUIT_MUTATION_NAMES[id]).join(' · '));
+      if(struck&&goal.Thundercharged)issues.push('Thunderstruck → 직접 강화');
+      if(amberlit&&goal.Ambercharged)issues.push('Amberlit → Amberbound 강화 대기');
+      if(has('Dawnlit')&&goal.Dawncharged)issues.push('Dawnlit → Dawnbound 강화 대기');
+    }
+    if(goal.size100){if(!sizeKnown)issues.push('크기 확인 필요');else if(!sizeSatisfied)issues.push('크기 '+fruit.size+' / '+minSize);}
+    if(fruit.preserved&&!basic)issues.push('보존됨 · 변경 불가');
+    if(timeKnown&&fruit.endTime>now)issues.push('성장 중');
+    if(fruit.locked)issues.push('열매 잠금');
+    const status=unknown?'확인 필요':advanced?'최상위 완료':basic?'기본 완료':fruit.preserved?'보존 · 미완료':conflicts.length?'변이 충돌':has('Gold')&&colorChecked&&!colorSatisfied?'색 변이 충돌':'목표 미달';
+    return {key:JSON.stringify([String(tileIndex),fruit.slotId??index,species,fruit.startTime??null]),species,tileIndex:String(tileIndex),slotId:fruit.slotId??index,
+      mutations,mutationKnown,size: sizeKnown?fruit.size:null,size100,sizeSatisfied,unknown,rainbow,struck,charged,amberlit,amberbound,gold:has('Gold'),
+      colorChecked,colorSatisfied,thunderChecked,thunderSatisfied,amberChecked,amberSatisfied,thunderCleanser,amberCleanser,lunarChecked:amberChecked,lunarSatisfied:amberSatisfied,lunarCleanser:amberCleanser,dawnlit:has('Dawnlit'),dawnbound:has('Dawncharged'),noMutation:mutationKnown&&mutations.length===0,conflicts,preserved:fruit.preserved===true,growing:timeKnown?fruit.endTime>now:null,basic,advanced,status,issues};
+  }
+  function countMonitoredFruit(rows) {
+    const count=test=>rows.filter(test).length;
+    return {mutationCounts:Object.fromEntries(Object.keys(FRUIT_MUTATION_NAMES).map(id=>[id,count(r=>r.mutationKnown&&r.mutations.includes(id))])),lunarSatisfied:count(r=>r.lunarChecked&&r.mutationKnown&&r.lunarSatisfied),lunarMissing:count(r=>r.lunarChecked&&r.mutationKnown&&!r.lunarSatisfied),lunarCleanser:count(r=>r.lunarCleanser),dawnlit:count(r=>r.dawnlit),dawnbound:count(r=>r.dawnbound),total:rows.length,basic:count(r=>r.basic&&!r.unknown),advanced:count(r=>r.advanced&&!r.unknown),rainbow:count(r=>r.rainbow),size100:count(r=>r.size100),sizeSatisfied:count(r=>r.sizeSatisfied),sizeMissing:count(r=>r.size!==null&&!r.sizeSatisfied),
+      colorSatisfied:count(r=>r.colorChecked&&r.mutationKnown&&r.colorSatisfied),colorMissing:count(r=>r.colorChecked&&r.mutationKnown&&!r.colorSatisfied),thunderSatisfied:count(r=>r.thunderChecked&&r.mutationKnown&&r.thunderSatisfied),amberSatisfied:count(r=>r.amberChecked&&r.mutationKnown&&r.amberSatisfied),
+      thunderCleanser:count(r=>r.thunderCleanser),amberCleanser:count(r=>r.amberCleanser),struck:count(r=>r.struck),charged:count(r=>r.charged),thunderMissing:count(r=>r.thunderChecked&&r.mutationKnown&&!r.thunderSatisfied),
+      amberlit:count(r=>r.amberlit),amberbound:count(r=>r.amberbound),amberMissing:count(r=>r.amberChecked&&r.mutationKnown&&!r.amberSatisfied),
+      conflict:count(r=>r.conflicts.length>0),gold:count(r=>r.gold),noMutation:count(r=>r.noMutation),preserved:count(r=>r.preserved),unknown:count(r=>r.unknown),growing:count(r=>r.growing===true)};
+  }
+  function fruitMonitorSnapshot(data,selection,now,conditions,minSize=100) {
+    const objects=data?.garden?.tileObjects,ready=!!objects&&typeof objects==='object'&&!Array.isArray(objects);
+    const rows=[],unknownTiles=[];
+    if(ready)for(const [tileIndex,tile]of Object.entries(objects)) {
+      if(tile?.objectType!=='plant')continue;
+      if(!Array.isArray(tile.slots)){if(selection?.[tile.species]===true)unknownTiles.push(tileIndex);continue;}
+      for(let index=0;index<tile.slots.length;index++) {
+        const fruit=tile.slots[index];if(!fruit||typeof fruit!=='object')continue;
+        const species=typeof fruit.species==='string'&&fruit.species?fruit.species:tile.species;
+        // A selected plant includes its actual alternate fruit species (e.g. Stormcap).
+        // Never synthesize fruit from slot capacity or current weather.
+        if(selection?.[species]!==true&&selection?.[tile.species]!==true)continue;
+        rows.push(inspectFruit(fruit,tileIndex,index,tile.species,now,conditions,minSize));
+      }
+    }
+    return {ready,rows,unknownTiles,counts:countMonitoredFruit(rows)};
+  }
+
+  // Completion is never inferred from zero targets, missing slots or uncertain target data.
+  // Each visible mutation/size cell is independent; failure and cleanser cells never use this state.
+  function fruitMetricComplete(snapshot,count){
+    const total=snapshot?.counts?.total;
+    return snapshot?.ready===true&&Number.isInteger(total)&&total>0&&count===total&&snapshot.counts.unknown===0&&Array.isArray(snapshot.unknownTiles)&&snapshot.unknownTiles.length===0;
+  }
+
+  // Only an enabled goal matched by every known target receives a green background.
+  // Partial goals, prerequisites, missing/cleanser counts and uncertain data stay transparent.
+  function fruitMetricState(snapshot,count,status=false,selected=true){
+    return !status&&selected&&fruitMetricComplete(snapshot,count)?'complete':'neutral';
+  }
+
   class GameLink {
     constructor(page, changed = () => {}) {
       this.page = page; this.changed = changed; this.root = null; this.socket = null;
@@ -718,7 +868,8 @@
           const events=shopsChanged?this.observeShops():{restocked:[],eggPurchases:[]};
           const uiChanged=patches.some(p=>!p.path.endsWith('/secondsUntilRestock'));
           const feedChanged=patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/(inventory|petSlots)(?:\/|$)/.test(p.path));
-          this.changed(undefined,{type:'state',uiChanged,feedChanged,...events});
+          const gardenChanged=identityChanged || patches.some(p=>p.path==='' || /^\/child(?:\/data)?$/.test(p.path) || /^\/child\/data\/userSlots(?:\/\d+(?:\/data)?)?$/.test(p.path) || /^\/child\/data\/userSlots\/\d+\/data\/garden(?:\/|$)/.test(p.path));
+          this.changed(undefined,{type:'state',uiChanged,feedChanged,gardenChanged,...events});
         }
       }
       const attempt=this.nativeTeamAttempt;
@@ -798,7 +949,7 @@
     if (/stock|sold.?out/i.test(code)) return `재고 부족 · ${detail}`;
     return `게임 요청 거부: ${detail}`;
   }
-  const exported = { foodAllowed,foodLocked,foodLockKey,lockedFoodAllowed,defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood };
+  const exported = {journalOrder,inventoryCropGroups,FRUIT_MONITOR_CONDITION_DEFAULTS,fruitMonitorConditions,fruitMonitorSnapshot,fruitMetricComplete,fruitMetricState,fruitMonitorCardPlan,inspectFruit, foodAllowed,foodLocked,foodLockKey,lockedFoodAllowed,defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood };
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -831,7 +982,7 @@
     report('스킨 UI 준비 중입니다. 잠시 뒤 다시 눌러 주세요.');
   }
   page.addEventListener('snail-with-skins:config-change',syncSkinsControl);
-  let panel, content, footer, icon, shadow, lastPaint = 0, paintTimer=null;
+  let panel, content, footer, icon, cropIcon, shadow, lastPaint = 0, paintTimer=null, cropRevision=0;
   const pendingBuy=new Set();let drainTimer=null,draining=false,readyGeneration=-1;
   const pendingFeed=new Map(),feedStates=new Map();let feedTimer=null,lastFeedAt=0;
   let webhookQueue = Promise.resolve();
@@ -843,6 +994,7 @@
     if (footer) footer.textContent = message;
   }
   const game = new GameLink(page,(message,event) => {
+    if(!game.root || event?.type==='ready' || event?.gardenChanged)cropRevision++;
     if (message) report(message);
     if(!game.root) { pendingBuy.clear();clearFeeding();readyGeneration=-1;schedulePaint();return; }
     let data;try{data=game.data();}catch{return;}
@@ -1020,7 +1172,7 @@
     const all = new Set(Object.keys(catalog.eggs || {}));
     try { for (const i of game.data().inventory.items) if (i?.itemType === 'Egg') all.add(i.eggId); } catch {}
     let changed = false;
-    for (const id of all) if (id && !settings.eggs.order.includes(id)) { settings.eggs.order.push(id); changed = true; }
+    for (const id of journalOrder(catalog,'Egg',[...all])) if (id && !settings.eggs.order.includes(id)) { settings.eggs.order.push(id); changed = true; }
     if (changed) save();
   }
   const countEgg = (data,id) => data.inventory.items.reduce((n,i) => n+(i?.itemType === 'Egg' && i.eggId === id ? quantity(i) : 0),0);
@@ -1422,7 +1574,7 @@
   function itemLabel(type,id,subtitle) {
     const url=sprite(type,id);
     return el('div',{ class:'item' },url ? el('img',{ src:url,alt:'',loading:'lazy',onerror:event => event.target.hidden=true }) : el('span',{ text:type==='Egg'?'🥚':'✦',class:'fallback' }),
-      el('div',{ class:'grow' },el('div',{ text:title(type,id),class:'label' }),el('small',{ text:subtitle })));
+      el('div',{ class:'grow' },el('div',{class:'label'},title(type,id),...(type==='Seed'?seedBadges(id):[])),el('small',{ text:subtitle })));
   }
   function go(next) {
     dragEgg=''; shadow?.activeElement?.blur(); view=next; refresh(true);
@@ -1430,18 +1582,19 @@
   }
   function refresh(force = false) {
     if (!content) return;
-    syncSkinsControl();
+    syncSkinsControl();placeCropIcon();
     shadow.querySelector('.connection').textContent=game.root?'● 연결됨':'○ 연결 대기';
     shadow.querySelector('.stop').hidden=!running;
     placePanel();
     // Team options must still follow server patches while a select or text field
     // has focus. Update these controls in place without discarding the user's edit.
     if(view==='settings')syncTeamControls();
+    if(view==='crops' && content.querySelector('.crop-manager')){renderCropManager();placePanel();return;}
     // Background work must not replace an input while the user is editing it.
     if (!force && (dragEgg || (content.contains(shadow.activeElement) && ['INPUT','SELECT'].includes(shadow.activeElement?.tagName)))) return;
     lastPaint=Date.now(); content.replaceChildren();
     panel.classList.toggle('home',view==='home');
-    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',cleanse:'변이 지우기',settings:'설정' };
+    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',cleanse:'변이 지우기',locks:'인벤토리 잠금',crops:'작물 관리',settings:'설정' };
     shadow.querySelector('.page-name').textContent=names[view];
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
@@ -1453,7 +1606,9 @@
       if(homePage===1)content.append(el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),
         switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')),
         el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')),
-        el('div',{class:'menu-row'},button('🫧 변이 지우기',()=>go('cleanse'),'menu-link'),button('지우기',()=>cleanseStanding('selected'),'pill')));
+        el('div',{class:'menu-row'},button('🫧 변이 지우기',()=>go('cleanse'),'menu-link'),button('지우기',()=>cleanseStanding('selected'),'pill')),
+        el('div',{class:'menu-row'},button('🔒 인벤토리 잠금',()=>go('locks'),'menu-link'),button('잠금',()=>go('locks'),'pill')),
+        el('div',{class:'menu-row'},button('🏡 작물 관리',()=>go('crops'),'menu-link'),switchFor(settings.cropManager.iconVisible,v=>{settings.cropManager.iconVisible=v;placeCropIcon();},'작물 관리 아이콘 표시')));
       content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...settings.rooms.map(({name,room})=>
         el('a',{text:name,href:`https://magicgarden.gg/r/${room}`,title:`${room} 방으로 이동`} ))));
       const previous=button('◀',()=>{homePage=0;refresh(true);});previous.setAttribute('aria-label','이전 메뉴 페이지');previous.disabled=homePage===0;
@@ -1466,6 +1621,8 @@
       if (view==='hatch') renderHatch();
       if (view==='sell') renderSell();
       if (view==='feed') renderFeed();
+      if (view==='locks') renderInventoryLocks();
+      if (view==='crops') renderCropManager();
       if (view==='pot') renderPot();
       if (view==='cleanse') renderCleanse();
       if (view==='settings') renderSettings();
@@ -1473,6 +1630,148 @@
     if(footer.textContent!==status)footer.textContent=status;
     placePanel();
   }
+  const SEED_SHOPS={Seed:['Seed Shop','#97c786'],Rain:['Rain','#87bfee'],Snow:['Snow','#b0dbe6'],Thunder:['Thunderstorm','#e3cc78'],Dawn:['Dawn','#eea7bc'],Amber:['Amber Moon','#e4b16e'],Spooky:['Spooky Shop','#c3a1e9'],Apology:['Apology Shop','#9fcac6']};
+  function seedBadges(id) {
+    const entry=catalog.plants?.[id],shops=entry?.seed?.eligibleShops;
+    const source=Array.isArray(shops)&&shops.length?shops:catalog.plants?.[entry?.rareCropOf]?.seed?.eligibleShops || [];
+    return [...new Set(source.filter(v=>typeof v==='string'))].map(shop=>{
+      const [name,color]=SEED_SHOPS[shop] || [shop+' Shop','#b4bdb8'];
+      const node=el('span',{class:'seed-badge',text:name});node.style.setProperty('--badge',color);return node;
+    });
+  }
+  function renderInventoryLocks() {
+    let inventory;try{inventory=game.data().inventory;}catch{}
+    content.append(el('p',{text:'인벤토리에 있는 작물만 표시합니다. 그림을 누르면 같은 종류를 모두 잠그거나 풉니다. 일부만 잠겨 있으면 모두 잠급니다.'}),el('small',{text:'🔒 모두 잠김 · 🔓 모두 해제 · 🔓/🔒 일부 잠김. 보관함·씨앗·펫에는 적용하지 않습니다.'}));
+    const groups=inventoryCropGroups(inventory,catalog),grid=el('div',{class:'lock-grid'});
+    if(!inventory)content.append(el('p',{text:'인벤토리 동기화 대기'}));
+    else if(!groups.length)content.append(el('p',{text:'인벤토리에 작물이 없습니다.'}));
+    for(const group of groups) {
+      const name=title('Produce',group.id),state=group.state==='locked'?'🔒':group.state==='unlocked'?'🔓':'🔓/🔒';
+      const control=button('',()=>void lockCropSpecies(group.id,group.state!=='locked'),'crop-lock');
+      control.dataset.species=group.id;control.dataset.lock=group.state;control.disabled=!!running||group.invalid>0||!Array.isArray(inventory.favoritedItemIds);
+      control.setAttribute('aria-label',`${name} ${group.state==='locked'?'모두 잠금 해제':'모두 잠금'}`);
+      const url=sprite('Produce',group.id);
+      control.append(url?el('img',{src:url,alt:name,loading:'lazy',onerror:e=>e.target.hidden=true}):el('span',{text:'🌱'}),el('span',{class:'crop-name',text:name}),el('span',{text:state}),el('small',{text:`${group.locked}/${group.items.length}개 잠김`}));
+      if(control.disabled)control.title=running?'작업 진행 중':group.invalid?'개별 아이템 ID 확인 필요':'잠금 정보 동기화 대기';
+      grid.append(control);
+    }
+    content.append(grid);
+  }
+  async function lockCropSpecies(species,locked) {
+    await run('lock',async job=>{
+      const inventory=game.data().inventory;
+      if(!Array.isArray(inventory.favoritedItemIds))throw Error('잠금 정보 동기화 대기');
+      const ids=inventory.items.filter(i=>i?.itemType==='Produce'&&i.species===species).map(i=>i.id);
+      if(ids.some(id=>typeof id!=='string'||!id)||new Set(ids).size!==ids.length)throw Error('개별 작물 ID 확인 필요');
+      let done=0;
+      for(const id of ids) {
+        checkJob(job);
+        const inv=game.data().inventory,current=inv.items.find(i=>i?.id===id&&i.itemType==='Produce'&&i.species===species);
+        if(!current||foodLocked(inv,current)===locked)continue;
+        report(`${title('Produce',species)} ${locked?'잠금':'해제'} · ${done}/${ids.length}개 확인`);
+        await game.command('ToggleLockItem',{itemId:id},next=>{
+          const item=next.inventory.items.find(i=>i?.id===id&&i.itemType==='Produce'&&i.species===species);
+          return !!item&&foodLocked(next.inventory,item)===locked;
+        },12000,{stateConfirms:true});
+        done++;
+      }
+      report(`${title('Produce',species)} ${locked?'잠금':'해제'} 완료 · ${done}개 변경 확인`);
+    });
+  }
+  function monitorIcon(id,name=id) {
+    const raw=id==='CropCleanser'?meta('Tool',id).sprite:catalog.mutations?.[id]?.sprite;
+    let url='';try{const value=new URL(raw);if(value.protocol==='https:'&&value.hostname==='mg-api.ariedam.fr')url=value.href;}catch{}
+    return url?el('img',{src:url,alt:name,title:name,loading:'lazy',onerror:e=>e.target.replaceWith(el('span',{text:name,title:name}))}):el('span',{text:id==='missing'?'❌':id==='size100'?'📏':id==='CropCleanser'?'🫧':name,title:name});
+  }
+  let cropManagerUI=null;
+  function renderCropManager() {
+    const options=settings.cropManager;
+    if(!cropManagerUI?.root.isConnected) {
+      const root=el('div',{class:'crop-manager'}),stats=el('div',{class:'crop-stats'}),total=el('div',{class:'crop-total'}),notice=el('div',{class:'crop-info'});
+      const crops=el('details',{class:'shop-category',open:options.cropsOpen}),goals=el('details',{class:'shop-category',open:options.goalsOpen});
+      const cropSummary=el('span',{text:'대상 작물'}),choices=el('div',{class:'category-body'});
+      crops.append(el('summary',{},cropSummary),choices);goals.append(el('summary',{text:'완료 조건'}));
+      for(const [key,details] of [['cropsOpen',crops],['goalsOpen',goals]])details.addEventListener('toggle',()=>{if(!details.isConnected)return;settings.cropManager[key]=details.open;save();placePanel();});
+      const conditions=el('div',{class:'category-body'}),checks=new Map();
+      for(const [name,ids] of [['색 변이',['Rainbow','Gold']],['기상',['Thundercharged','Thunderstruck','Wet','Chilled','Frozen']],['달 변이',['Ambercharged','Ambershine','Dawncharged','Dawnlit']]]) {
+        const group=el('div',{class:'goal-options'});
+        for(const id of ids) {
+          const label=FRUIT_MUTATION_NAMES[id],input=el('input',{type:'checkbox',ariaLabel:`${label} 완료 조건`,checked:options.conditions[id],onchange:e=>{settings.cropManager.conditions[id]=e.target.checked;save();renderCropManager();}});
+          checks.set(id,input);group.append(el('label',{title:label},input,monitorIcon(id,label)));
+        }
+        conditions.append(el('div',{class:'goal-row'},el('small',{text:name}),group));
+      }
+      const sizeCheck=el('input',{type:'checkbox',checked:options.conditions.size100,ariaLabel:'크기 완료 조건',onchange:e=>{settings.cropManager.conditions.size100=e.target.checked;save();renderCropManager();}});
+      checks.set('size100',sizeCheck);
+      const size=el('input',{type:'number',min:50,max:100,step:1,value:options.minSize,ariaLabel:'완료 크기 기준',onchange:e=>{
+        const value=e.target.valueAsNumber;if(Number.isInteger(value)&&value>=50&&value<=100){settings.cropManager.minSize=value;save();renderCropManager();}else{e.target.value=settings.cropManager.minSize;report('완료 크기는 50~100 정수로 입력하세요.');}
+      }});
+      conditions.append(el('div',{class:'goal-row'},el('small',{text:'크기'}),el('div',{class:'goal-options'},el('label',{},sizeCheck,monitorIcon('size100','크기')),size,'이상')),
+        el('small',{text:'같은 줄은 하나만 충족해도 됩니다. 켜 둔 줄은 모두 충족해야 완료입니다. 선택된 목표가 모든 대상 열매에 적용되면 초록색으로 표시합니다.'}));goals.append(conditions);
+      root.append(stats,total,notice,crops,goals,el('small',{text:'내 밭의 실제 열매만 집계합니다. 자동 수확·세정·포션 사용은 하지 않습니다. ❌ 조건 미달 · 🫧 강화로 해결할 수 없어 Crop Cleanser가 필요한 열매(보존 열매 제외).'}));
+      content.append(root);cropManagerUI={root,stats,total,notice,crops,goals,cropSummary,choices,checks,size,choiceSignature:'',resultSignature:''};
+    }
+    const ui=cropManagerUI;
+    let data=null;try{data=game.data();}catch{}
+    if(ui.availableRevision!==cropRevision || ui.availableCatalog!==catalog) {
+      const available=new Set(Object.keys(catalog.plants || {}).filter(id=>catalog.plants[id]?.crop));
+      for(const tile of Object.values(data?.garden?.tileObjects || {}))if(tile?.objectType==='plant'&&typeof tile.species==='string')available.add(tile.species);
+      ui.availableIds=journalOrder(catalog,'Produce',[...available]);ui.availableRevision=cropRevision;ui.availableCatalog=catalog;
+      ui.availableSignature=JSON.stringify(ui.availableIds.map(id=>[id,title('Produce',id),sprite('Produce',id)]));
+    }
+    const ids=ui.availableIds,signature=ui.availableSignature;
+    // Keep selectors and focused number inputs intact when new garden data arrives.
+    if(ui.choiceSignature!==signature) {
+      ui.choiceSignature=signature;ui.choices.replaceChildren();ui.cropChecks=new Map();
+      ui.choices.append(el('div',{class:'pot-actions'},button('모두 선택',()=>{for(const id of ids)settings.cropManager.selected[id]=true;save();renderCropManager();}),button('모두 해제',()=>{settings.cropManager.selected={};save();renderCropManager();})));
+      for(const id of ids) {
+        const input=el('input',{type:'checkbox',checked:!!options.selected[id],ariaLabel:`${title('Produce',id)} 관리 대상`,onchange:e=>{settings.cropManager.selected[id]=e.target.checked;save();renderCropManager();}});ui.cropChecks.set(id,input);
+        ui.choices.append(el('label',{class:'row pot-crop'},input,itemLabel('Produce',id,'')));
+      }
+    }
+    for(const [id,input] of ui.cropChecks)input.checked=!!options.selected[id];
+    const selectedCount=ids.filter(id=>options.selected[id]).length;
+    ui.cropSummary.textContent=`대상 작물 · ${selectedCount}종`;
+    const scanKey=JSON.stringify([cropRevision,!!data,options.selected,options.conditions,options.minSize]);
+    if(ui.scanKey!==scanKey){ui.scanKey=scanKey;ui.snapshot=fruitMonitorSnapshot(data,options.selected,game.serverNow()??Date.now(),options.conditions,options.minSize);}
+    const snapshot=ui.snapshot,c=snapshot.counts,plan=fruitMonitorCardPlan(options.conditions);
+    const resultSignature=JSON.stringify([c,snapshot.ready,snapshot.unknownTiles,plan,options.conditions,options.minSize]);
+    if(ui.resultSignature===resultSignature)return;ui.resultSignature=resultSignature;
+    ui.total.replaceChildren(el('span',{text:'대상 열매'}),el('b',{text:snapshot.ready?`${c.total}개`:'—'}));
+    ui.notice.textContent=!snapshot.ready?'밭 정보 동기화 대기':`${c.basic}개 완료 · 최상위 ${c.advanced}개 · 보존 ${c.preserved}개${c.unknown||snapshot.unknownTiles.length?` · 확인 필요 ${c.unknown}개 / ${snapshot.unknownTiles.length}칸`:''}`;
+    const metric=(ids,count,label,status=false,selected=true)=>{
+      const node=el('div',{class:`crop-metric ${fruitMetricState(snapshot,count,status,selected)}`,title:label,ariaLabel:`${label} ${count}개`},el('div',{class:'metric-icons'},ids.map(id=>monitorIcon(id,FRUIT_MUTATION_NAMES[id] || label))),el('b',{text:`${count}개`}),el('small',{text:label}));return node;
+    };
+    const lines=[];
+    if(plan.color.length||plan.size) {
+      const line=el('div',{class:'crop-metrics'});
+      if(plan.color.length)line.append(metric(plan.color,c.colorSatisfied,'색 충족'),metric(['missing'],c.colorMissing,'색 미달',true));
+      if(plan.size)line.append(metric(['size100'],c.sizeSatisfied,`크기 ${options.minSize} 이상`),metric(['missing'],c.sizeMissing,'크기 미달',true));
+      line.style.gridTemplateColumns=`repeat(${line.childElementCount},minmax(0,1fr))`;lines.push(line);
+    }
+    for(const [ids,missing,cleanser,name] of [[plan.weather,c.thunderMissing,c.thunderCleanser,'기상'],[plan.lunar,c.lunarMissing,c.lunarCleanser,'달']]) {
+      if(!ids.length)continue;
+      const line=el('div',{class:'crop-metrics'});
+      for(const id of ids)line.append(metric([id],c.mutationCounts[id],FRUIT_MUTATION_NAMES[id],false,!!options.conditions[id]));
+      line.append(metric(['missing'],missing,`${name} 미달`,true),metric(['CropCleanser'],cleanser,`${name} 세정 필요`,true));
+      line.style.gridTemplateColumns=`repeat(${line.childElementCount===6?3:Math.min(4,line.childElementCount)},minmax(0,1fr))`;lines.push(line);
+    }
+    if(!lines.length)lines.push(el('p',{text:'완료 조건을 하나 이상 선택하세요.'}));ui.stats.replaceChildren(...lines);
+  }
+  function placeCropIcon() {
+    if(!cropIcon)return;cropIcon.hidden=!settings.cropManager.iconVisible;
+    const p=settings.cropManager.iconPosition || {left:innerWidth-60,top:innerHeight*.35+54};
+    cropIcon.style.left=`${Math.max(8,Math.min(innerWidth-52,p.left))}px`;cropIcon.style.top=`${Math.max(8,Math.min(innerHeight-52,p.top))}px`;
+  }
+  function enableCropIconDrag() {
+    let drag=null,suppress=false;
+    cropIcon.addEventListener('click',e=>{if(suppress){e.preventDefault();e.stopImmediatePropagation();suppress=false;}},true);
+    cropIcon.addEventListener('pointerdown',e=>{if(e.button!==0)return;const rect=cropIcon.getBoundingClientRect();drag={id:e.pointerId,x:e.clientX,y:e.clientY,left:rect.left,top:rect.top,moved:false};cropIcon.setPointerCapture(e.pointerId);});
+    cropIcon.addEventListener('pointermove',e=>{if(!drag||drag.id!==e.pointerId)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(!drag.moved&&Math.hypot(dx,dy)<4)return;drag.moved=true;settings.cropManager.iconPosition={left:drag.left+dx,top:drag.top+dy};placeCropIcon();});
+    const finish=e=>{if(!drag||drag.id!==e.pointerId)return;suppress=drag.moved;if(drag.moved){const r=cropIcon.getBoundingClientRect();settings.cropManager.iconPosition={left:r.left,top:r.top};save();}drag=null;if(cropIcon.hasPointerCapture(e.pointerId))cropIcon.releasePointerCapture(e.pointerId);};
+    for(const name of ['pointerup','pointercancel','lostpointercapture'])cropIcon.addEventListener(name,finish);
+  }
+
   function renderCleanse() {
     content.append(el('p',{text:'서 있는 작물의 열매를 하나씩 판정합니다. 메뉴의 지우기는 켜 둔 변이가 하나라도 포함된 열매만 처리합니다. 다른 열매는 유지됩니다.'}),
       el('small',{text:'예: Frozen만 켜면 Frozen이 있는 열매의 날씨 변이를 모두 지웁니다. 그 열매의 다른 날씨 변이도 함께 제거되며, Gold와 Rainbow에는 영향이 없습니다.'}));
@@ -1509,7 +1808,16 @@
   function renderBuy() {
     content.append(row('입고 시 구매',switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매'),'접속·On·재입고 때 확인 · 품목 사이 1~3초'),
       row('보관함 자동 이동',switchFor(settings.autoStore,v=>settings.autoStore=v,'보관함 자동 이동'),'이 스크립트로 구매한 수량만 이동합니다.'));
-    const rows=shopRows(), entries=new Map();
+    const rows=shopRows(),entries=new Map(),availability=new Map(),inventoryCounts=new Map(),storedCounts=new Map();
+    for(const r of rows){const key=choiceKey(r.item);availability.set(key,(availability.get(key)||0)+r.available);}
+    let inventory;try{inventory=game.data().inventory;}catch{}
+    const addCounts=(items,map)=>{for(const item of items || [])if(FIELDS[item?.itemType]){const key=choiceKey(item);map.set(key,(map.get(key)||0)+quantity(item));}};
+    addCounts(inventory?.items,inventoryCounts);
+    for(const storage of inventory?.storages || []) {
+      // Some older storage entries omit itemType; infer it only for known stores.
+      const type=Object.keys(STORAGE_FOR).find(type=>STORAGE_FOR[type]===(storage.decorId || storage.id));
+      addCounts(storageItems(storage).map(item=>item&&!item.itemType&&type?{...item,itemType:type}:item),storedCounts);
+    }
     for (const [type,source] of [['Seed',catalog.plants],['Egg',catalog.eggs],['Tool',catalog.items],['Decor',catalog.decor]]) {
       for (const id of Object.keys(source || {})) {
         const entry=meta(type,id);
@@ -1521,7 +1829,8 @@
       const [type,id]=key.split(':'); if (FIELDS[type] && id) entries.set(key,{type,id});
     }
     for (const type of ['Seed','Egg','Tool','Decor']) {
-      const group=[...entries.values()].filter(e=>e.type===type);
+      const byId=new Map([...entries.values()].filter(e=>e.type===type).map(e=>[e.id,e]));
+      const group=journalOrder(catalog,type,[...byId.keys()]).map(id=>byId.get(id));
       if (!group.length) continue;
       const selected=group.filter(({id})=>settings.buy[`${type}:${id}`]).length;
       const category=el('details',{ class:'shop-category',open:!settings.collapsedShops.includes(type) });
@@ -1539,12 +1848,9 @@
       const nextAt=Date.parse(liveInfo[shopKey]?.nextRestockAt);
       if(Number.isFinite(nextAt))categoryBody.append(el('small',{text:`다음 갱신 ${new Date(nextAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})}${nextAt<Date.now()?' · 서버 갱신 확인 대기':''}`}));
       for (const {id} of group) {
-        const key=`${type}:${id}`, available=rows.filter(r=>r.id===id && r.item.itemType===type).reduce((n,r)=>n+r.available,0);
-        let held='—',breakdown='';try{
-          const data=game.data(),item={itemType:type,[FIELDS[type]]:id},inventory=purchaseCapacity(data,item).held;
-          const stored=(data.inventory.storages || []).reduce((n,s)=>n+storageCount(s,item),0);
-          held=inventory+stored;breakdown=`인벤토리 ${inventory} · 보관함 ${stored}`;
-        }catch{}
+        const key=`${type}:${id}`,available=availability.get(key)||0;
+        const held=inventory?(inventoryCounts.get(key)||0)+(storedCounts.get(key)||0):'—';
+        const breakdown=inventory?`인벤토리 ${inventoryCounts.get(key)||0} · 보관함 ${storedCounts.get(key)||0}`:'';
         const label=itemLabel(type,id,`재고 ${available} · 보유 ${held}`);label.title=breakdown;
         categoryBody.append(el('div',{ class:'row' },label,switchFor(!!settings.buy[key],v=>settings.buy[key]=v,`${title(type,id)} 구매`)));
       }
@@ -1579,7 +1885,7 @@
   function renderHatch() {
     content.append(el('p',{text:'현재 부화 가능한 알만 처리합니다. 인벤토리가 가득 차면 중단합니다.'}),button('모두 부화',hatchAll,'primary'));
     let tiles={};try{tiles=garden(game.data());}catch{}
-    const ids=[...new Set([...Object.keys(catalog.eggs||{}),...Object.values(tiles).filter(t=>t?.eggId).map(t=>t.eggId)])];
+    const ids=journalOrder(catalog,'Egg',[...new Set([...Object.keys(catalog.eggs||{}),...Object.values(tiles).filter(t=>t?.eggId).map(t=>t.eggId)])]);
     for (const id of ids) {
       const eggs=Object.values(tiles).filter(t=>t?.eggId===id),ready=eggs.filter(t=>readyEgg(t)).length;
       const b=button('부화',()=>void hatch(id),'pill');b.disabled=ready===0||!!running;
@@ -1631,7 +1937,7 @@
       for(const {species,probability} of group.pets) {
         const animal=folded('openPets',`${group.id}:${species}`,itemLabel('Pet',species,probability===null?'알 정보 없음':`등장 확률 ${Number(probability.toFixed(2))}%`),'feed-pet');
         animal.dataset.species=species;
-        const diet=[...new Set(catalog.pets?.[species]?.diet || [])];
+        const diet=journalOrder(catalog,'Produce',[...new Set(catalog.pets?.[species]?.diet || [])]);
         for(const [type,id] of [...diet.map(id=>['Produce',id]),['Tool','ReplenishPotion']]) {
           const key=foodKey(species,type,id);
           const toggle=switchFor(foodAllowed(settings,species,type,id),v=>{
@@ -1786,7 +2092,7 @@
   }
   function importSettings(text) {
     if(running)throw Error('진행 중인 작업이 끝난 뒤 설정을 불러오세요.');
-    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;clearFeeding();save();syncEggs();placeIcon();refresh(true);report('모든 설정을 불러왔습니다.');
+    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;clearFeeding();save();syncEggs();placeIcon();placeCropIcon();content.replaceChildren();refresh(true);report('모든 설정을 불러왔습니다.');
     if(!settings.autoBuy)pendingBuy.clear();
     if(settings.autoBuy&&!wasBuy){void loadCatalog();void loadLive();scheduleBuy();}
     if(settings.autoFeed)void loadCatalog().then(observeFeed);
@@ -1858,6 +2164,10 @@
       .switch{display:inline-flex;flex:none;position:relative;width:35px;height:21px;cursor:pointer}.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}.switch span{width:35px;height:21px;border-radius:12px;background:#ffffff24;pointer-events:none}.switch span:after{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#d7dedb;margin:3px;transition:transform .15s}.switch input:checked+span{background:#498060}.switch input:checked+span:after{transform:translateX(14px);background:#f1fff6}.switch input:focus-visible+span{outline:2px solid #6caf84;outline-offset:3px}
       select,input:not([type=checkbox]){background:#161d1acc;border:1px solid #ffffff26;border-radius:4px;padding:5px;max-width:100%;min-width:0}select option{background:#252e29;color:#e5e8e9}.row select{max-width:175px}.row input[type=number]{width:84px}.body>input{width:100%;margin:8px 0}.body>button{margin:6px 5px 3px 0}.primary{background:#3e664b;border-color:#6a9876;color:#f2fff6}.primary:hover{background:#4a775a}.item{display:flex;align-items:center;gap:9px;flex:1;min-width:0}.item img,.fallback{width:25px;height:25px;object-fit:contain;image-rendering:pixelated;flex:none}.fallback{text-align:center;line-height:25px}.grip{color:#88998f;cursor:grab;user-select:none}.arrows{display:flex;flex-direction:column;gap:2px}.arrows button{font-size:10px;padding:0 5px;border-radius:4px}
       .shop-category{margin-top:7px;border:1px solid #ffffff1b;border-radius:5px;overflow:hidden}.shop-category summary{cursor:pointer;display:flex;align-items:center;gap:7px;padding:7px 8px;background:#ffffff05;list-style:none;font-weight:600;user-select:none}.shop-category summary::-webkit-details-marker{display:none}.shop-category summary:before{content:'›';font-size:17px;line-height:1;color:#9eaea4;transition:transform .12s}.shop-category[open]>summary:before,.feed-pet[open]>summary:before{transform:rotate(90deg)}.shop-category summary small{margin:0 0 0 auto;font-size:10px;font-weight:400}.category-body{padding:0 8px}.category-body .row:last-child{border-bottom:0}
+      .seed-badge{display:inline-block;font-size:9px;font-weight:500;line-height:1.5;white-space:nowrap;padding:0 4px;margin-left:4px;border:1px solid var(--badge);border-radius:4px;color:var(--badge);background:color-mix(in srgb,var(--badge) 10%,transparent);vertical-align:middle}
+      .lock-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:8px}.crop-lock{padding:7px 3px;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0}.crop-lock img{width:32px;height:32px;object-fit:contain;image-rendering:pixelated}.crop-lock .crop-name{font-size:10px;overflow-wrap:anywhere}.crop-lock[data-lock=locked]{border-color:#67957a;background:#34554055}.crop-lock[data-lock=mixed]{border-style:dashed}.crop-lock small{font-size:10px}
+      .crop-stats{display:flex;flex-direction:column;gap:5px}.crop-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.crop-metric{border:1px solid #ffffff1b;border-radius:4px;padding:5px 2px;text-align:center;min-width:0}.crop-metric.complete{background:#42674277;border-color:#7a9c65}.metric-icons{display:flex;justify-content:center;align-items:center;gap:2px;height:22px}.metric-icons img,.goal-options img{width:21px;height:21px;object-fit:contain;image-rendering:pixelated}.crop-metric b{display:block;font-size:12px}.crop-metric small{font-size:9px;margin:1px 0 0;overflow-wrap:anywhere}.crop-total{display:flex;justify-content:space-between;border:1px solid #ffffff1b;border-radius:4px;padding:6px 8px;margin-top:6px}.crop-info{font-size:10px;color:#b5c3bb;margin:5px 0}.goal-row{display:flex;gap:7px;align-items:center;padding:6px 0;border-bottom:1px solid #ffffff10}.goal-row>small{width:39px;flex:none}.goal-options{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.goal-options label{display:flex;align-items:center;gap:2px;font-size:10px}.goal-options input[type=checkbox]{margin:0;accent-color:#6caf84}.goal-options input[type=number]{width:55px}.crop-manager .pot-actions button{font-size:11px}
+      .metric-icons{overflow:hidden;min-width:0}.metric-icons span{font-size:10px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .summary{padding:8px;background:#ffffff08;border:1px solid #ffffff13;border-radius:5px;margin:8px 0}footer{padding:6px 10px;border-top:1px solid #ffffff16;font-size:10px;color:#a7b7ad;background:#00000012;overflow-wrap:anywhere;flex:none;max-height:75px;overflow:auto}pre{white-space:pre-wrap;font-size:10px;line-height:1.8;color:#99aaa0;max-height:160px;overflow:auto}.overlay{position:fixed;inset:0;background:#10171299;display:grid;place-items:center;z-index:2147483646}.dialog{background:#262e28;border:1px solid #ffffff24;border-radius:8px;padding:15px;width:370px;max-width:calc(100vw - 24px);box-shadow:0 20px 80px #0007}.dialog ul{max-height:200px;overflow:auto;padding-left:20px}.actions{display:flex;justify-content:flex-end;gap:8px}@media(max-width:520px){.panel{max-height:calc(100dvh - 16px)}.body{padding:0 10px 9px}.row select{max-width:170px}}
     `});
     icon=button('🐌',()=>{panel.hidden=!panel.hidden;if(!panel.hidden)refresh();},'icon');icon.setAttribute('aria-label','Original Snail 열기');
@@ -1869,6 +2179,8 @@
     icon.addEventListener('pointermove',e=>{if(!drag)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(!drag.moved&&Math.hypot(dx,dy)<4)return;drag.moved=true;settings.position={left:drag.left+dx,top:drag.top+dy};placeIcon();});
     const endDrag=e=>{if(!drag)return;suppressClick=drag.moved;if(drag.moved){const r=icon.getBoundingClientRect();settings.position={left:r.left,top:r.top};save();}drag=null;if(icon.hasPointerCapture(e.pointerId))icon.releasePointerCapture(e.pointerId);};
     icon.addEventListener('pointerup',endDrag);icon.addEventListener('pointercancel',endDrag);
+    cropIcon=button('🏡',()=>{if(!panel.hidden&&view==='crops')panel.hidden=true;else{panel.hidden=false;go('crops');}},'icon crop-manager-icon');
+    cropIcon.setAttribute('aria-label','작물 관리 열기');enableCropIconDrag();
     content=el('main',{class:'body'});footer=el('footer',{role:'status','ariaLive':'polite',text:status});
     panel=el('section',{class:'panel',hidden:true,ariaLabel:'Original Snail'},el('header',{},
       el('div',{class:'brand'},el('strong',{text:'Original Snail',class:'title-handle',title:'드래그하여 창 이동'}),button('×',()=>panel.hidden=true)),
@@ -1876,7 +2188,7 @@
       el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}))),content,footer,
       button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed')setAutoFeed(false);if(running.kind==='buy')setAutoBuy(false);save();}report('현재 요청 확인 후 중지합니다.');},'stop'));
     enablePanelDrag(panel.querySelector('header'));
-    shadow.append(style,icon,panel);placeIcon();window.addEventListener('resize',()=>{placeIcon();placePanel();});refresh();void loadCatalog();
+    shadow.append(style,icon,cropIcon,panel);placeIcon();placeCropIcon();window.addEventListener('resize',()=>{placeIcon();placeCropIcon();placePanel();});refresh();void loadCatalog();
   }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',mount,{once:true});else mount();
 })();
