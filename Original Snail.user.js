@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    Original Snail
 // @author       0_"
-// @version      1.8.0
+// @version      1.8.1
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -29,7 +29,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.8.0', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.8.1', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -46,10 +46,50 @@
     ReplenishPotion:99,XPPotion:99,RainbowPotion:99,
     WetPotion:1,DawnlitPotion:1,AmberlitPotion:1,GoldPotion:1,Shovel:1,Camera:1
   };
+  // v1864: ring pins for ordinary stacks refer to items; Camera/Shovel may exist
+  // only as a ring pin. Never count an ordinary stack twice or use stored food.
+  function inventoryPins(inventory) {
+    const seen=new Set(),items=inventory?.items || [];
+    return (Array.isArray(inventory?.toolRing)?inventory.toolRing:[]).filter(pin=>{
+      if(!pin || typeof pin.id!=='string' || !['Seed','Egg','Tool','Decor','Produce','Plant','Pet'].includes(pin.itemType))return false;
+      const key=`${pin.itemType}:${pin.id}`;
+      if(seen.has(key))return false;
+      if(!FIELDS[pin.itemType] && !items.some(i=>i?.id===pin.id && i.itemType===pin.itemType))return false;
+      seen.add(key);return true;
+    }).slice(0,5);
+  }
+  const inventoryBagCount=inventory=>{
+    const pins=new Set(inventoryPins(inventory).map(pin=>`${pin.itemType}:${pin.id}`));
+    return (inventory?.items || []).filter(i=>i && !pins.has(`${i.itemType}:${FIELDS[i.itemType]?itemId(i):i.id}`)).length;
+  };
+  function acquiredOutsideBag(data,item,metadata={}) {
+    const id=itemId(item),inventory=data.inventory || {};
+    const inBag=(inventory.items || []).some(i=>i?.itemType===item.itemType && itemId(i)===id && quantity(i)>0);
+    const ring=item.itemType==='Tool' && (metadata.joinsToolRingOnAcquire===true || ['Camera','Shovel'].includes(id)) && !inBag &&
+      inventoryPins(inventory).some(pin=>pin.itemType==='Tool' && pin.id===id)?1:0;
+    const installed=item.itemType==='Decor' && metadata.isOneTimePurchase===true &&
+      (inventory.storages || []).some(s=>(s?.decorId || s?.id)===id)?1:0;
+    return ring+installed;
+  }
+  function purchaseBudget(data,item,metadata={}) {
+    const info={...metadata,...item};
+    if(finite(info.dustPrice)&&info.dustPrice>=0) {
+      const known=finite(data.magicDustCount)&&data.magicDustCount>=0;
+      return {currency:'Magic Dust',known,affordable:info.dustPrice===0?Infinity:known?Math.floor(data.magicDustCount/info.dustPrice):0};
+    }
+    if(finite(info.coinPrice)&&info.coinPrice>=0) {
+      const known=finite(data.coinsCount)&&data.coinsCount>=0;
+      return {currency:'코인',known,affordable:info.coinPrice===0?Infinity:known?Math.floor(data.coinsCount/info.coinPrice):0};
+    }
+    // Credit-only items never reach a purchase endpoint that spends credits.
+    return {currency:'구매 가격',known:false,affordable:0};
+  }
   function purchaseCapacity(data,item,metadata = {}) {
     const id=itemId(item), info={...metadata,...item};
+    const storedOwner=info.isOneTimePurchase===true && info.joinsToolRingOnAcquire===true &&
+      (data.inventory?.storages || []).some(s=>storageItems(s).some(i=>i?.itemType===item.itemType && itemId(i)===id && quantity(i)>0))?1:0;
     const held=(data.inventory?.items || []).reduce((sum,entry) =>
-      sum+(entry?.itemType === item.itemType && itemId(entry) === id ? quantity(entry) : 0),0);
+      sum+(entry?.itemType === item.itemType && itemId(entry) === id ? quantity(entry) : 0),0)+acquiredOutsideBag(data,item,info)+storedOwner;
     const max=Number(info.maxInventoryQuantity);
     const limit=info.isOneTimePurchase === true ? 1 : Number.isFinite(max) && max>0 ? Math.floor(max) :
       !own(info,'maxInventoryQuantity') && !own(info,'isOneTimePurchase') && item.itemType === 'Tool' ? TOOL_LIMIT_FALLBACK[id] ?? Infinity : Infinity;
@@ -78,7 +118,7 @@
     const stackable=item.itemType!=='Tool' || entries.some(i=>finite(i.quantity));
     const merges=stackable && storageCount(storage,item)>0;
     if(!merges && storageItems(storage).filter(Boolean).length>=slots)return {reason:'보관함 가득 참 · 인벤토리 유지'};
-    const entry=entries.find(i=>!i.locked && !(data.inventory.favoritedItemIds || []).includes(i.id || itemId(i)));
+    const entry=entries.find(i=>!foodLocked(data.inventory,i));
     if(!entry)return {reason:'잠긴 품목 · 인벤토리 유지'};
     return {storage,storageId,held,amount:Math.min(amount,quantity(entry)),itemKey:moveItemKey(entry)};
   }
@@ -501,7 +541,7 @@
     // The native planner consumes the first PlanterPot entry; never unlock or
     // silently consume a locked stack, even if another unlocked stack follows it.
     const first=items[0];if(first.locked || first.isLocked || first.favorited || locks.includes(first.id) || locks.includes(first.toolId))throw Error('화분 잠금 · 사용할 Planter Pot의 잠금을 해제하세요.');
-    if(data.inventory.items.filter(Boolean).length>=100)throw Error('인벤토리 가득 참 · 화분 담기 중단');
+    if(inventoryBagCount(data.inventory)>=100)throw Error('인벤토리 가득 참 · 화분 담기 중단');
     return first;
   }
   class NativeGameTeams {
@@ -950,6 +990,7 @@
     return `게임 요청 거부: ${detail}`;
   }
   const exported = {journalOrder,inventoryCropGroups,FRUIT_MONITOR_CONDITION_DEFAULTS,fruitMonitorConditions,fruitMonitorSnapshot,fruitMetricComplete,fruitMetricState,fruitMonitorCardPlan,inspectFruit, foodAllowed,foodLocked,foodLockKey,lockedFoodAllowed,defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood };
+  Object.assign(exported,{inventoryPins,inventoryBagCount,acquiredOutsideBag,purchaseBudget});
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -1033,7 +1074,7 @@
       if(response.status===304) { catalogAt=Date.now();GM_setValue(CATALOG_KEY,{at:catalogAt,etag:catalogETag,data:catalog});return; }
       if (response.status !== 200) throw Error('이미지·품목 API 응답 오류');
       const data = JSON.parse(response.responseText);
-      if (!data.eggs || !data.pets) throw Error('품목 API 형식 오류');
+      if (['plants','items','decor','eggs','pets'].some(key=>!data?.[key] || typeof data[key]!=='object' || Array.isArray(data[key]))) throw Error('품목 API 일부 누락 · 기존 캐시 유지');
       catalog = data; catalogAt = Date.now();catalogRetryAt=0;
       catalogETag=String(response.responseHeaders||'').match(/^etag:\s*(.+)$/im)?.[1]?.trim()||'';
       GM_setValue(CATALOG_KEY,{at:catalogAt,etag:catalogETag,data:catalog});syncEggs();observeFeed();schedulePaint();
@@ -1296,11 +1337,14 @@
           if (!capacity.remaining) { reason=`소지 한도 ${capacity.held}/${capacity.limit} · 추가 구매 건너뜀`; break; }
           if (!before.available) { reason='재고 부족'; break; }
           if (before.cycle !== initial.cycle) { reason='재입고 감지 · 다음 검사에서 계속'; break; }
-          const price = before.item.coinPrice ?? meta(type,id).coinPrice;
-          const affordable=finite(price) && price>0 && finite(data.coinsCount)?Math.floor(data.coinsCount/price):Infinity;
+          const budget=purchaseBudget(data,before.item || item,meta(type,id)),affordable=budget.affordable;
+          if(!budget.known && affordable!==Infinity){reason=`${budget.currency} 정보 동기화 대기`;break;}
           const amount=Math.max(0,Math.floor(Math.min(before.available,capacity.remaining,affordable)));
-          if (!amount) { reason='잔액 부족'; break; }
-          if (data.inventory.items.filter(Boolean).length >= CAPACITY && !data.inventory.items.some(i => i?.itemType === type && itemId(i) === id)) { reason='인벤토리 가득 참'; break; }
+          if (!amount) { reason=`${budget.currency} 잔액 부족`; break; }
+          const joinsRing=type==='Tool' && meta(type,id).joinsToolRingOnAcquire===true && inventoryPins(data.inventory).length<5 &&
+            !(data.inventory.storages || []).some(s=>storageCount(s,item)>0);
+          const installsStorage=type==='Decor' && meta(type,id).isOneTimePurchase===true && finite(meta(type,id).baseCapacitySlots);
+          if (inventoryBagCount(data.inventory) >= CAPACITY && !joinsRing && !installsStorage && !data.inventory.items.some(i => i?.itemType === type && itemId(i) === id)) { reason='인벤토리 가득 참'; break; }
           if(amount<target)reason=capacity.remaining<=affordable?'소지 한도에 맞춰 구매':'잔액에 맞춰 구매';
           report(`${title(type,id)} 모두 구매 중 · ${amount}개`);
           sent=amount;
@@ -1311,7 +1355,7 @@
             if(after.cycle!==before.cycle || after.restockId!==before.restockId)return false;
             confirmed=Math.max(confirmed,Math.max(0,Math.min(amount,after.bought-before.bought,purchaseCapacity(next,item,meta(type,id)).held-capacity.held)));
             return confirmed===amount;
-          });
+          },12000,{stateConfirms:true});
         } while(false);
       } catch(error) {
         reason=error.message;
@@ -1347,6 +1391,9 @@
     report(`알 심기 종료 · 밭에 빈칸 없음${done ? ` · ${done}개 심음` : ''}`);
   }
   async function storePurchased(job,item,purchased,heldBefore) {
+    if(acquiredOutsideBag(game.data(),item,meta(item.itemType,itemId(item)))>0 &&
+      !game.data().inventory.items.some(i=>i?.itemType===item.itemType && itemId(i)===itemId(item)))
+      return item.itemType==='Tool'?'도구 고리 지급 확인':'게임 보관함 설치 확인';
     let moved=0;
     while(moved<purchased && settings.autoStore) {
       checkJob(job);
@@ -1496,7 +1543,7 @@
           checkJob(job);
           const data=game.data(), tile=garden(data)[target.slot];
           if (!readyEgg(tile) || JSON.stringify(tile) !== target.signature) continue;
-          if (data.inventory.items.filter(Boolean).length >= CAPACITY) throw Error(`인벤토리 가득 참 · ${done}개 부화 완료`);
+          if (inventoryBagCount(data.inventory) >= CAPACITY) throw Error(`인벤토리 가득 참 · ${done}개 부화 완료`);
           const petIds=new Set(data.inventory.items.filter(i => i?.itemType === 'Pet').map(i => i.id));
           await game.command('HatchEgg',{ slot:target.slot },next => JSON.stringify(garden(next)[target.slot]) !== target.signature &&
             next.inventory.items.some(i => i?.itemType === 'Pet' && !petIds.has(i.id)),12000,{stateConfirms:true});
@@ -1821,7 +1868,7 @@
     for (const [type,source] of [['Seed',catalog.plants],['Egg',catalog.eggs],['Tool',catalog.items],['Decor',catalog.decor]]) {
       for (const id of Object.keys(source || {})) {
         const entry=meta(type,id);
-        if (entry.coinPrice != null) entries.set(`${type}:${id}`,{type,id});
+        if (finite(entry.coinPrice) || finite(entry.dustPrice)) entries.set(`${type}:${id}`,{type,id});
       }
     }
     for (const r of rows) entries.set(choiceKey(r.item),{type:r.item.itemType,id:r.id});
@@ -1849,8 +1896,9 @@
       if(Number.isFinite(nextAt))categoryBody.append(el('small',{text:`다음 갱신 ${new Date(nextAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})}${nextAt<Date.now()?' · 서버 갱신 확인 대기':''}`}));
       for (const {id} of group) {
         const key=`${type}:${id}`,available=availability.get(key)||0;
-        const held=inventory?(inventoryCounts.get(key)||0)+(storedCounts.get(key)||0):'—';
-        const breakdown=inventory?`인벤토리 ${inventoryCounts.get(key)||0} · 보관함 ${storedCounts.get(key)||0}`:'';
+        const outside=inventory?acquiredOutsideBag({inventory},{itemType:type,[FIELDS[type]]:id},meta(type,id)):0;
+        const held=inventory?(inventoryCounts.get(key)||0)+(storedCounts.get(key)||0)+outside:'—';
+        const breakdown=inventory?`인벤토리 ${inventoryCounts.get(key)||0} · 보관함 ${storedCounts.get(key)||0}${outside?` · ${type==='Tool'?'도구 고리':'설치됨'} ${outside}`:''}`:'';
         const label=itemLabel(type,id,`재고 ${available} · 보유 ${held}`);label.title=breakdown;
         categoryBody.append(el('div',{ class:'row' },label,switchFor(!!settings.buy[key],v=>settings.buy[key]=v,`${title(type,id)} 구매`)));
       }
