@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    Original Snail
 // @author       0_"
-// @version      1.8.1
+// @version      1.8.2
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -15,6 +15,7 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @connect      mg-api.ariedam.fr
+// @connect      magicgarden.gg
 // @connect      discord.com
 // @connect      raw.githubusercontent.com
 // @updateURL    https://raw.githubusercontent.com/migm-user/cg/main/Original%20Snail.user.js
@@ -29,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.8.1', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.8.2', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -372,6 +373,20 @@
     const time = Number(value);
     return time > 0 && Number.isFinite(time) && (time < 1e11 ? time * 1000 : time) <= now;
   }
+  // A hatch changes taps; growth abilities may change maturedAt. Neither means
+  // that a different egg has been planted. Server-only reveal data is not read.
+  function eggStamp(tile) {
+    if(String(tile?.objectType).toLowerCase()!=='egg' || typeof tile.eggId!=='string' || !tile.eggId)return '';
+    const planted=finite(tile.plantedAt)?tile.plantedAt:null;
+    return JSON.stringify([tile.eggId,planted,planted===null?(tile.maturedAt??tile.endTime??tile.readyAt??tile.hatchTime??null):null]);
+  }
+  function eggTaps(tile) {
+    if(tile?.taps===undefined)return 0;
+    if(!Number.isSafeInteger(tile.taps)||tile.taps<0)throw Error('알 터치 상태 확인 필요 · 추가 부화 중단');
+    return tile.taps;
+  }
+  const gainedHatchPet=(data,petIds,eggId)=>(data.inventory?.items || []).some(p=>
+    p?.itemType==='Pet' && typeof p.id==='string' && p.id && !petIds.has(p.id) && (!p.sourceEggId || p.sourceEggId===eggId));
   function purchaseRecord(shop,record,staleMarker='') {
     const modern=own(shop,'restockId') || own(record,'restockId');
     if(modern) {
@@ -990,7 +1005,7 @@
     return `게임 요청 거부: ${detail}`;
   }
   const exported = {journalOrder,inventoryCropGroups,FRUIT_MONITOR_CONDITION_DEFAULTS,fruitMonitorConditions,fruitMonitorSnapshot,fruitMetricComplete,fruitMetricState,fruitMonitorCardPlan,inspectFruit, foodAllowed,foodLocked,foodLockKey,lockedFoodAllowed,defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood };
-  Object.assign(exported,{inventoryPins,inventoryBagCount,acquiredOutsideBag,purchaseBudget});
+  Object.assign(exported,{inventoryPins,inventoryBagCount,acquiredOutsideBag,purchaseBudget,eggStamp,eggTaps,gainedHatchPet});
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -1530,27 +1545,59 @@
     }
   }
   function hatchAll() { void hatch(); }
+  async function hatchOne(job,target) {
+    let data=game.data(),tile=garden(data)[target.slot];
+    if(eggStamp(tile)!==target.stamp || !readyEgg(tile,game.serverNow()??Date.now()))return false;
+    const petIds=new Set(data.inventory.items.filter(p=>p?.itemType==='Pet').map(p=>p.id));
+    const complete=next=>!garden(next)[target.slot] && gainedHatchPet(next,petIds,target.eggId);
+    // v2078 HatchEgg advances a public tap counter before it reveals the pet.
+    // Only a confirmed increase permits the next request; never retry an ACK-
+    // only, rejected, or timed-out command. Bound even a future unknown protocol.
+    for(let step=0;step<=32;step++) {
+      data=game.data();if(complete(data))return true;
+      checkJob(job);tile=garden(data)[target.slot];
+      if(!tile) {
+        // Garden removal and inventory delivery may arrive in separate frames.
+        const until=Date.now()+12000;
+        while(Date.now()<until){checkJob(job);data=game.data();if(complete(data))return true;if(garden(data)[target.slot])break;await sleep(80);}
+        throw Error('알 제거 후 펫 지급 확인 대기 · 추가 부화 중단');
+      }
+      if(eggStamp(tile)!==target.stamp)throw Error('대상 알이 바뀌어 부화를 중단했습니다.');
+      if(step===32)throw Error('알 부화 단계 확인 한도 도달 · 자동 반복 중단');
+      if(!readyEgg(tile,game.serverNow()??Date.now()))throw Error('알 성장 상태가 바뀌어 부화를 중단했습니다.');
+      if(inventoryBagCount(data.inventory)>=CAPACITY)throw Error('인벤토리 가득 참');
+      const taps=eggTaps(tile);
+      report(`${title('Egg',target.eggId)} 부화 진행 · 터치 ${taps+1}`);
+      await game.command('HatchEgg',{slot:target.slot},next=>{
+        const after=garden(next)[target.slot];
+        if(!after)return gainedHatchPet(next,petIds,target.eggId);
+        if(eggStamp(after)!==target.stamp)throw Error('대상 알이 바뀌어 부화를 중단했습니다.');
+        const count=eggTaps(after);
+        if(count<taps)throw Error('알 터치 상태가 초기화되어 부화를 중단했습니다.');
+        return count>taps;
+      },12000,{stateConfirms:true});
+      if(complete(game.data()))return true;
+      // Give the current reveal's split frames time to settle, not a burst of
+      // guessed taps. Stop is checked before every subsequent request.
+      await sleep(200);
+    }
+    throw Error('알 부화 단계 확인 한도 도달 · 자동 반복 중단');
+  }
   async function hatch(eggId = '') {
     await run('hatch',async job => {
       const initial=garden(game.data());
       const slots=orderedTiles(settings.eggs.direction,Object.keys(initial).map(Number))
-        .filter(slot => readyEgg(initial[slot]) && (!eggId || initial[slot].eggId === eggId))
-        .map(slot => ({ slot, signature:JSON.stringify(initial[slot]) }));
+        .filter(slot => readyEgg(initial[slot],game.serverNow()??Date.now()) && (!eggId || initial[slot].eggId === eggId))
+        .map(slot => ({slot,eggId:initial[slot].eggId,stamp:eggStamp(initial[slot])}));
       if (!slots.length) { report('부화 가능한 알이 없습니다.'); return; }
-      let done=0;
-      await withTeam('hatch',job,async () => {
+      let done=0,skipped=0;
+      try { await withTeam('hatch',job,async () => {
         for (const target of slots) {
           checkJob(job);
-          const data=game.data(), tile=garden(data)[target.slot];
-          if (!readyEgg(tile) || JSON.stringify(tile) !== target.signature) continue;
-          if (inventoryBagCount(data.inventory) >= CAPACITY) throw Error(`인벤토리 가득 참 · ${done}개 부화 완료`);
-          const petIds=new Set(data.inventory.items.filter(i => i?.itemType === 'Pet').map(i => i.id));
-          await game.command('HatchEgg',{ slot:target.slot },next => JSON.stringify(garden(next)[target.slot]) !== target.signature &&
-            next.inventory.items.some(i => i?.itemType === 'Pet' && !petIds.has(i.id)),12000,{stateConfirms:true});
-          report(`알 부화 · ${++done}/${slots.length}`);
+          if(await hatchOne(job,target)){done++;report(`알 부화 · ${done}/${slots.length}`);}else skipped++;
         }
-      });
-      report(`알 부화 완료 · ${done}개`);
+      }); }catch(error){throw Error(`알 부화 ${done}개 확인 · ${error.message}`);}
+      report(`알 부화 완료 · ${done}개${skipped?` · 바뀐 대상 ${skipped}개 제외`:''}`);
     });
   }
   async function sell() {
@@ -1648,6 +1695,7 @@
       if(homePage===0)for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['feed','펫 먹이','🍽️'],['settings','설정','⚙️']]) {
         const control=key==='feed'?switchFor(settings.autoFeed,setAutoFeed,'펫 먹이 자동 지급'):key==='buy' ? switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매') :
           button(key==='plant'?'심기':key==='hatch'?'부화':key==='sell'?'판매':'⚙️',() => key==='plant'?void run('plant',plant):key==='hatch'?hatchAll():key==='sell'?void sell():go('settings'),'pill');
+        if(key==='hatch')control.disabled=!!running;
         content.append(el('div',{ class:'menu-row' },button(`${glyph}  ${name}`,()=>go(key),'menu-link'),control));
       }
       if(homePage===1)content.append(el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),
@@ -1931,11 +1979,12 @@
     }
   }
   function renderHatch() {
-    content.append(el('p',{text:'현재 부화 가능한 알만 처리합니다. 인벤토리가 가득 차면 중단합니다.'}),button('모두 부화',hatchAll,'primary'));
+    const all=button('모두 부화',hatchAll,'primary');all.disabled=!!running;
+    content.append(el('p',{text:'한 번 누르면 현재 부화 가능한 알을 끝까지 부화합니다. 인벤토리가 가득 차거나 중지를 누르면 멈춥니다.'}),all);
     let tiles={};try{tiles=garden(game.data());}catch{}
     const ids=journalOrder(catalog,'Egg',[...new Set([...Object.keys(catalog.eggs||{}),...Object.values(tiles).filter(t=>t?.eggId).map(t=>t.eggId)])]);
     for (const id of ids) {
-      const eggs=Object.values(tiles).filter(t=>t?.eggId===id),ready=eggs.filter(t=>readyEgg(t)).length;
+      const eggs=Object.values(tiles).filter(t=>t?.eggId===id),ready=eggs.filter(t=>readyEgg(t,game.serverNow()??Date.now())).length;
       const b=button('부화',()=>void hatch(id),'pill');b.disabled=ready===0||!!running;
       content.append(el('div',{class:'row'},itemLabel('Egg',id,`부화 가능 ${ready} / 심어진 알 ${eggs.length}`),b));
     }
@@ -2455,7 +2504,7 @@ var __esm = (fn, res) => function __init() {
   async function waitForPixi(handles, timeoutMs = 15e3) {
     const app = await waitWithTimeout(handles.appReady, timeoutMs, "PIXI app");
     const renderer = await waitWithTimeout(handles.rendererReady, timeoutMs, "PIXI renderer");
-    return { app, renderer, version: handles.pixiVersion };
+    return { app:handles.app ?? app, renderer:handles.renderer ?? renderer, version: handles.pixiVersion };
   }
   var init_hooks = __esm({
     "src/game/sprites/pixi/hooks.ts"() {
@@ -2550,8 +2599,8 @@ var __esm = (fn, res) => function __init() {
       return bundle;
     };
     const check = () => {
-      const app = root4.__PIXI_APP__ || root4.PIXI_APP || root4.app || null;
-      const renderer = root4.__PIXI_RENDERER__ || root4.PIXI_RENDERER__ || root4.renderer || app?.renderer || null;
+      const app = root4.__PIXI_APP__ || root4.PIXI_APP || root4.app || hooks2.app || null;
+      const renderer = root4.__PIXI_RENDERER__ || root4.PIXI_RENDERER__ || root4.renderer || app?.renderer || hooks2.renderer || null;
       return app && renderer ? { app, renderer, version: root4.__PIXI_VERSION__ || null } : null;
     };
     const hit = check();
@@ -2614,6 +2663,7 @@ var __esm = (fn, res) => function __init() {
     };
     const deadline = Date.now() + 1e4;
     while (Date.now() < deadline) {
+      app=hooks?.app || app;renderer=hooks?.renderer || renderer;
       snapshot3();
       try {
         return getCtors(app);
@@ -3168,11 +3218,16 @@ var __esm = (fn, res) => function __init() {
       }
       return { base, atlasJsons, blobs };
     } catch {
-      return null;
+      // Modern releases moved hashed KTX2 pages out of /version/.../assets.
+      // The public API supplies the same frame keys/coordinates. No whole atlas
+      // download/decompression is necessary to hide an existing GPU texture.
+      const data=await getJSON2('https://mg-api.ariedam.fr/assets/sprite-data?full=1');
+      return bundleFromSpriteData(data,base);
     }
   }
   async function loadTextures(base, prefetched) {
     const usePrefetched = prefetched && prefetched.base === base ? prefetched : null;
+    if(usePrefetched?.apiCatalog){atlasBundle=usePrefetched;atlasBundleResolve?.(atlasBundle);atlasBundleResolve=null;ctx.state.loaded=true;return;}
     const atlasJsons = usePrefetched?.atlasJsons ?? await loadAtlasJsons(base, await getJSON2(joinPath(base, "manifest.json")));
     atlasBundle = usePrefetched ?? { base, atlasJsons, blobs: /* @__PURE__ */ new Map() };
     atlasBundleResolve?.(atlasBundle);
@@ -3219,18 +3274,20 @@ var __esm = (fn, res) => function __init() {
       throw err;
     }
     const base = `${ctx.cfg.origin.replace(/\/$/, "")}/version/${version}/assets/`;
-    if (!prefetchPromise) prefetchPromise = prefetchAtlas(base);
+    if (!prefetchPromise) prefetchPromise = prefetchAtlas(base).then(value=>({value}),error=>({error}));
     const { app, renderer: resolvedRenderer, version: pixiVersion } = await resolvePixiFast(hooks);
     await ensureDocumentReady();
     const renderer = resolvedRenderer || app?.renderer || app?.render || null;
     ctx.state.ctors = await waitForCtors(app, renderer);
-    ctx.state.app = app;
+    ctx.state.app = hooks.app || app;
     ctx.state.renderer = renderer;
     ctx.state.version = pixiVersion ?? version;
     ctx.state.base = base;
     watchRendererHealth(ctx.state, hooks);
     pageWindow.__SNAIL_SKINS_SPRITE_STATE__ = ctx.state;
-    await loadTextures(ctx.state.base, await prefetchPromise);
+    const prefetched=await prefetchPromise;
+    if(prefetched.error){prefetchPromise=null;throw prefetched.error;}
+    await loadTextures(ctx.state.base,prefetched.value);
     console.log("[Snail with Skins] ready", {
       version: ctx.state.version,
       pixi: version,
@@ -3238,15 +3295,16 @@ var __esm = (fn, res) => function __init() {
     });
   }
   async function startWithRetry() {
-    const RETRY_DELAY_MS = 2e3;
+    let retryDelay = 5e3;
     for (; ; ) {
       try {
         await start();
         return;
       } catch (err) {
         console.error("[Snail with Skins] failed, retrying", err);
+        pageWindow.dispatchEvent(new pageWindow.CustomEvent('snail-with-skins:load-error',{detail:{message:err.message || String(err)}}));
         ctx.state.started = false;
-        await sleep(RETRY_DELAY_MS);
+        await sleep(retryDelay);retryDelay=Math.min(30000,retryDelay*2);
       }
     }
   }
@@ -3335,7 +3393,10 @@ function isEdited(rule) { return rule.hidden || rule.opacity !== 1 || rule.scale
 function rectOf(texture) { return texture?.frame ?? texture?._frame; }
 function sourceOfTexture(texture) { return texture?.source ?? texture?._source ?? texture?.baseTexture; }
 function rectSignature(rect) { return rect && [rect.x,rect.y,rect.width,rect.height].join('|'); }
-function atlasName(value) { return String(value || '').split(/[?#]/)[0].split('/').pop().replace(/\.(?:png|webp|ktx2|jpg)$/i,'').toLowerCase(); }
+function atlasName(value) {
+  const name=String(value || '').split(/[?#]/)[0].split('/').pop().replace(/\.(?:png|webp|ktx2|jpg|json)$/i,'').toLowerCase();
+  return /^(sprites-\d+)(?:\.|$)/.exec(name)?.[1] || name;
+}
 function atlasHints(source) {
   return [source?.label,source?.cacheId,source?.resource?.url,source?.resource?.src,source?.resource?._url,source?.resource?.source?.src,source?.resource?.src,source?.source?.src,...(source?.textureCacheIds || [])].map(atlasName).filter(Boolean);
 }
@@ -3392,10 +3453,28 @@ function targetsFrom(bundle) {
     for (const [key,fd] of Object.entries(data?.frames || {})) {
       if (!categoryFor(key) || !(fd.frame?.w>0 && fd.frame?.h>0)) continue;
       const fr=fd.frame;
-      targets.set(key,{key,object:objectFor(key),category:categoryFor(key),atlas:atlasName(relPath(path,data.meta.image)),width:fr.w,height:fr.h,rect:{x:fr.x,y:fr.y,width:fd.rotated?fr.h:fr.w,height:fd.rotated?fr.w:fr.h}});
+      targets.set(key,{key,object:objectFor(key),category:categoryFor(key),atlas:atlasName(data.meta.image),width:fr.w,height:fr.h,apiImage:fd.apiImage || '',rect:{x:fr.x,y:fr.y,width:fd.rotated?fr.h:fr.w,height:fd.rotated?fr.w:fr.h}});
     }
   }
   return targets;
+}
+function bundleFromSpriteData(data,base) {
+  if(!data || !Array.isArray(data.categories))throw Error('최신 이미지 목록 형식 오류');
+  const version=String(base).match(/\/version\/([^/]+)\//)?.[1],apiVersion=String(data.baseUrl || '').match(/\/version\/([^/]+)\//)?.[1];
+  if(version&&apiVersion&&version!==apiVersion)throw Error('게임과 이미지 API 버전이 달라 갱신을 기다립니다.');
+  const atlasJsons={};let count=0;
+  for(const group of data.categories)for(const item of Array.isArray(group.items)?group.items:[]) {
+    const key=item.key || item.id,fr=item.frame;
+    if(typeof key!=='string'||!categoryFor(key)||!fr||![fr.x,fr.y,fr.w,fr.h].every(Number.isFinite)||fr.x<0||fr.y<0||fr.w<=0||fr.h<=0||fr.w>32768||fr.h>32768)continue;
+    let url;try{url=new URL(item.url);if(url.protocol!=='https:'||!['magicgarden.gg','mg-api.ariedam.fr'].includes(url.hostname))continue;}catch{continue;}
+    const path=url.pathname.split('/').pop()+'.json';
+    if(!atlasJsons[path])atlasJsons[path]={frames:{},meta:{image:url.href}};
+    const cat=typeof item.cat==='string'?item.cat:group.cat,name=typeof item.name==='string'?item.name:key.split('/').pop();
+    atlasJsons[path].frames[key]={...item,frame:{...fr},apiImage:`https://mg-api.ariedam.fr/assets/sprites/${encodeURIComponent(cat)}/${encodeURIComponent(name)}.png${apiVersion?`?v=${encodeURIComponent(apiVersion)}`:''}`};
+    if(++count>20000)throw Error('이미지 목록이 너무 큽니다.');
+  }
+  if(!count)throw Error('최신 API에서 작물·변이 이미지를 찾지 못했습니다.');
+  return {base,atlasJsons,blobs:new Map(),apiCatalog:true};
 }
 function createMatcher(targets, cachedTextures, snapshots = new Map()) {
   const identities=new Map(), byRect=new Map(), sourceAtlases=new Map();
@@ -3427,12 +3506,15 @@ function createMatcher(targets, cachedTextures, snapshots = new Map()) {
 }
 function composeCanvas(target, image, rule) {
   const canvas=document.createElement('canvas');
-  canvas.width=Math.max(1,Math.round(target.width*rule.scale));
-  canvas.height=Math.max(1,Math.round(target.height*rule.scale));
+  const hidden=rule.hidden || rule.opacity===0;
+  // Hidden frames need only one transparent texel; patchTexture preserves the
+  // original logical bounds. Avoid hundreds of full-size blank GPU images.
+  canvas.width=hidden?1:Math.max(1,Math.round(target.width*rule.scale));
+  canvas.height=hidden?1:Math.max(1,Math.round(target.height*rule.scale));
   if (canvas.width*canvas.height>16*1024*1024) throw Error('이미지가 너무 큽니다. 크기를 줄여 주세요.');
   const ctx=canvas.getContext('2d');
   if (!ctx) throw Error('이미지 그리기를 사용할 수 없습니다.');
-  if (rule.hidden || rule.opacity===0) return canvas;
+  if (hidden) return canvas;
   if (!image) throw Error('원본 이미지를 읽지 못했습니다. 다시 연결해 주세요.');
   const fit=Math.min(canvas.width/image.width,canvas.height/image.height);
   const w=image.width*fit,h=image.height*fit;
@@ -3444,7 +3526,7 @@ function composeCanvas(target, image, rule) {
 
 // Keep pure configuration and texture operations directly testable in Node.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports={newConfig,readConfig,resolveRule,categoryFor,objectFor,createMatcher,patchTexture,restoreTexture,composeCanvas};
+  module.exports={newConfig,readConfig,resolveRule,categoryFor,objectFor,createMatcher,patchTexture,restoreTexture,composeCanvas,bundleFromSpriteData,targetsFrom,atlasName};
 } else {
   void bootSkins();
 }
@@ -3460,6 +3542,7 @@ async function bootSkins() {
   let status='게임과 이미지 목록을 기다리는 중…', error='', cacheNotice='';
   try { const stored=localStorage.getItem(CONFIG_KEY); if (stored) config=readConfig(JSON.parse(stored)); }
   catch (e) { error=`저장된 설정을 불러오지 못했습니다: ${e.message}`; }
+  root.addEventListener('snail-with-skins:load-error',event=>{status='게임 이미지 연결 재시도 대기';report(Error(event.detail?.message || '이미지 연결 실패'));});
   init_sprites();
   // Frames can be decoded before the sprite bridge finishes its atlas pass.
   api.ready=false;
@@ -3556,8 +3639,9 @@ async function bootSkins() {
       const holder=queue.shift();
       if (!holder || typeof holder!=='object' || seen.has(holder)) continue;
       seen.add(holder);
-      if (typeof holder.renderTextureCache?.rebakeAll==='function') {
-        holder.renderTextureCache.rebakeAll(); cacheNotice=''; return true;
+      const cache=holder.renderTextureCache,rebake=cache?.rebakeAll || cache?.evictIdleAndRebake;
+      if (typeof rebake==='function') {
+        rebake.call(cache);cacheNotice='';return true;
       }
       for (const key of ['app','engine','game','renderer','stage','_app','quinoa']) if (holder[key]) queue.push(holder[key]);
     }
@@ -3578,7 +3662,13 @@ async function bootSkins() {
   }
   async function originalImage(target) {
     if (originals.has(target.key)) return originals.get(target.key);
-    const state=getSpriteState(), texture=state.tex.get(target.key);
+    const state=getSpriteState();
+    let texture=state.tex.get(target.key) || cacheTexture(target.key);
+    if(!texture){const match=createMatcher(targets,new Map());texture=walkSprites().map(node=>node.texture).find(t=>match(t)?.key===target.key);}
+    if ((!texture || !state.renderer?.extract) && target.apiImage) {
+      const bitmap=await createImageBitmap(await getBlob2(target.apiImage));
+      try{const canvas=document.createElement('canvas');canvas.width=bitmap.width;canvas.height=bitmap.height;canvas.getContext('2d').drawImage(bitmap,0,0);originals.set(target.key,canvas);return canvas;}finally{bitmap.close?.();}
+    }
     if (!texture || !state.renderer?.extract) return null;
     const sprite=new state.ctors.Sprite(texture);
     try {
