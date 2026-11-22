@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    Original Snail
 // @author       0_"
-// @version      1.8.2
+// @version      1.9.0
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -30,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.8.2', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.9.0', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -142,9 +142,10 @@
     eggs: { order: [], enabled: {}, direction: '좌' },
     cropManager: {iconVisible:false,iconPosition:null,minSize:100,selected:{},conditions:{...FRUIT_MONITOR_CONDITION_DEFAULTS},cropsOpen:false,goalsOpen:false},
     pots: { selected: {} },
+    decorPickup: { selected: {}, autoStore: false },
     cleanse: { selected: {} }, rooms: defaultRooms(false),
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
-    teams: { hatch: '', sell: '', restore: 'current' },
+    teams: { hatch: '', sell: '', cropSell: '', restore: 'current' },
     registeredTeams: [], manualTeamsOpen: false,
     webhook: { enabled: false, url: '' }, position: null, panelPosition: null, collapsedShops: []
   });
@@ -159,7 +160,7 @@
       }
     };
     for (const key of ['autoBuy', 'autoStore', 'autoFeed','manualTeamsOpen']) bool(raw, key, s);
-    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed','pots','cleanse','cropManager']) {
+    for (const section of ['eggs', 'protect', 'teams', 'webhook', 'feed','pots','cleanse','cropManager','decorPickup']) {
       if (own(raw, section) && (!raw[section] || typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw Error(`${section}: 형식 오류`);
     }
     const dict = source => {
@@ -171,6 +172,10 @@
       }
       return result;
     };
+    if(raw.decorPickup) {
+      bool(raw.decorPickup,'autoStore',s.decorPickup);
+      if(own(raw.decorPickup,'selected'))s.decorPickup.selected=dict(raw.decorPickup.selected);
+    }
     if(raw.cropManager) {
       const source=raw.cropManager,target=s.cropManager;
       for(const key of ['iconVisible','cropsOpen','goalsOpen'])bool(source,key,target);
@@ -240,7 +245,7 @@
         s.protect.threshold = raw.protect.threshold;
       }
     }
-    for (const key of ['hatch','sell','restore']) if (own(raw.teams, key)) {
+    for (const key of ['hatch','sell','cropSell','restore']) if (own(raw.teams, key)) {
       if (typeof raw.teams[key] !== 'string' || raw.teams[key].length > 160) throw Error('팀 설정 형식 오류');
       s.teams[key] = raw.teams[key];
     }
@@ -506,6 +511,64 @@
     }
     for(let slot=0;slot<200;slot++){const point=potTilePosition(index,slot);if(point?.x===position.x && point.y===position.y)return slot;}
     return null;
+  }
+  const TILE_LISTS={Dirt:'tileObjects',Boardwalk:'boardwalkTileObjects'};
+  const EDGE_PARTS=['line','hanging','backdrop'];
+  function decorStandingCell(root,selfId,map,currentPosition) {
+    const ownSlot=mySlot(root,selfId),owner=root?.child?.data?.userSlots?.indexOf(ownSlot);
+    const pos=currentPosition===undefined?ownSlot?.position ?? ownSlot?.data?.position:currentPosition;
+    if(!Number.isInteger(owner)||owner<0||!Number.isInteger(pos?.x)||!Number.isInteger(pos?.y))return null;
+    if(map?.globalTileIdxToDirtTile && Number.isInteger(map.cols) && map.cols>0) {
+      if(pos.x<0 || pos.x>=map.cols || pos.y<0 || (finite(map.rows)&&pos.y>=map.rows))return null;
+      const global=pos.y*map.cols+pos.x, dirt=map.globalTileIdxToDirtTile[global],walk=map.globalTileIdxToBoardwalk?.[global];
+      const tile=dirt || walk;
+      if(tile?.userSlotIdx!==owner)return null;
+      const owned=[...map.userSlotIdxAndDirtTileIdxToGlobalTileIdx?.[owner] || [],...map.userSlotIdxAndBoardwalkTileIdxToGlobalTileIdx?.[owner] || []];
+      if(!owned.length)return null;
+      const slot=dirt?tile.dirtTileIdx:tile.boardwalkTileIdx;
+      if(!Number.isInteger(slot))return null;
+      return {tileType:dirt?'Dirt':'Boardwalk',slot,x:pos.x-Math.min(...owned.map(i=>i%map.cols)),y:pos.y-Math.min(...owned.map(i=>Math.floor(i/map.cols)))};
+    }
+    // Stock v2162 plot geometry, including the boardwalk around and through it.
+    if(owner>5)return null;
+    const x=pos.x-13-owner%3*26,y=pos.y-13-Math.floor(owner/3)*22;
+    if(x<0 || x>22 || y<0 || y>11)return null;
+    if(y===0)return {tileType:'Boardwalk',slot:x,x,y};
+    if(y===11)return {tileType:'Boardwalk',slot:53+x,x,y};
+    if(x===0 || x===11 || x===22)return {tileType:'Boardwalk',slot:23+(y-1)*3+x/11,x,y};
+    return {tileType:'Dirt',slot:(y-1)*20+x-(x<11?1:2),x,y};
+  }
+  function decorPickupTargets(garden,cell=null) {
+    const targets=[];
+    for(const [tileType,list] of Object.entries(TILE_LISTS)) {
+      if(cell && cell.tileType!==tileType)continue;
+      const tiles=garden?.[list] || {};
+      const entries=cell?[[String(cell.slot),tiles[cell.slot]]]:Object.entries(tiles);
+      for(const [key,tile] of entries) {
+        if(!/^\d+$/.test(key)||tile?.objectType!=='decor'||typeof tile.decorId!=='string')continue;
+        targets.push({tileType,slot:Number(key),id:tile.decorId,rotation:tile.rotation,cropId:tile.mountedCrop?.id});
+      }
+    }
+    const edges=garden?.edgeObjects || {};
+    const sides=cell?new Map([
+      [`h:${cell.x}:${cell.y}`,'up'],[`h:${cell.x}:${cell.y+1}`,'down'],
+      [`v:${cell.x}:${cell.y}`,'left'],[`v:${cell.x+1}:${cell.y}`,'right']
+    ]):null;
+    for(const [key,parts] of Object.entries(edges)) {
+      const match=/^([hv]):(\d{1,3}):(\d{1,3})$/.exec(key);
+      if(!match || (sides && !sides.has(key)))continue;
+      const [,orientation,x,y]=match,edge={orientation,x:Number(x),y:Number(y)};
+      const side=sides?.get(key) || (orientation==='h'?(edge.y===12?'down':'up'):(edge.x===23?'right':'left'));
+      for(const part of EDGE_PARTS) {
+        const decor=parts?.[part];
+        if(typeof decor?.decorId==='string')targets.push({edge,key,part,side,id:decor.decorId,mirrored:decor.mirrored});
+      }
+    }
+    return targets;
+  }
+  function unprotectedProduce(inventory) {
+    if(!Array.isArray(inventory?.favoritedItemIds))throw Error('작물 잠금 정보 확인 대기');
+    return inventory.items.filter(item=>item?.itemType==='Produce' && !foodLocked(inventory,item) && !inventory.favoritedItemIds.includes(item.species));
   }
   const isPotPlant=tile=>tile?.objectType==='plant' && typeof tile.species==='string' && finite(tile.plantedAt) && Array.isArray(tile.slots);
   const potPlantStamp=tile=>isPotPlant(tile)?JSON.stringify([tile.species,tile.plantedAt]):'';
@@ -1005,7 +1068,7 @@
     return `게임 요청 거부: ${detail}`;
   }
   const exported = {journalOrder,inventoryCropGroups,FRUIT_MONITOR_CONDITION_DEFAULTS,fruitMonitorConditions,fruitMonitorSnapshot,fruitMetricComplete,fruitMetricState,fruitMonitorCardPlan,inspectFruit, foodAllowed,foodLocked,foodLockKey,lockedFoodAllowed,defaultRooms,roomShortcut,feedChoiceKeys,feedBulkState,setFeedChoices,cleanserFruitSelected,cleanserMutations,growSlotStamp,cleanserTargets,cleanserCount,cleanserAvailable,potGroup,journalPlants,potTilePosition,standingPlantSlot,isPotPlant,potPlantStamp,potTargets,planterCount,planterAvailable,settingsFrom,parseSettings,defaults,orderedTiles,applyPatches,mySlot,accountKey,maxStrength,saleReason,readyEgg,stock,purchaseRecord,shopViewMode,GameLink,NativeGameTeams,members,activeIds,sameIds,webhookURL,purchaseCapacity,storagePlan,hungerPercent,hungryStage,petFoodGroups,chooseFood };
-  Object.assign(exported,{inventoryPins,inventoryBagCount,acquiredOutsideBag,purchaseBudget,eggStamp,eggTaps,gainedHatchPet});
+  Object.assign(exported,{inventoryPins,inventoryBagCount,acquiredOutsideBag,purchaseBudget,eggStamp,eggTaps,gainedHatchPet,decorStandingCell,decorPickupTargets,unprotectedProduce});
   if (typeof module === 'object' && module.exports) { module.exports = exported; return; }
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (page.__SNAIL_IN_CHERRY__) return;
@@ -1031,14 +1094,18 @@
   }
   function openSkins() {
     const api=skinsAPI();
-    if(api?.setPanelOpen){api.setPanelOpen(true);return;}
+    if(api?.setPanelOpen){syncSkinsCatalog();api.setPanelOpen(true);return;}
     // Reuse an already running standalone instance without a second renderer hook.
     const host=document.querySelector('#snail-with-skins'),skinPanel=host?.shadowRoot?.querySelector('.panel');
     if(skinPanel){host.shadowRoot.querySelector('.launcher')?.remove();host.style.zIndex='2147483646';skinPanel.hidden=false;return;}
     report('스킨 UI 준비 중입니다. 잠시 뒤 다시 눌러 주세요.');
   }
+  function syncSkinsCatalog() {
+    if(!catalog.plants)return;
+    skinsAPI()?.setCatalog?.(catalog,journalOrder(catalog,'Produce',Object.keys(catalog.plants)));
+  }
   page.addEventListener('snail-with-skins:config-change',syncSkinsControl);
-  let panel, content, footer, icon, cropIcon, shadow, lastPaint = 0, paintTimer=null, cropRevision=0;
+  let panel, content, footer, icon, cropIcon, cropPanel, cropContent, shadow, lastPaint = 0, paintTimer=null, cropRevision=0;
   const pendingBuy=new Set();let drainTimer=null,draining=false,readyGeneration=-1;
   const pendingFeed=new Map(),feedStates=new Map();let feedTimer=null,lastFeedAt=0;
   let webhookQueue = Promise.resolve();
@@ -1092,7 +1159,7 @@
       if (['plants','items','decor','eggs','pets'].some(key=>!data?.[key] || typeof data[key]!=='object' || Array.isArray(data[key]))) throw Error('품목 API 일부 누락 · 기존 캐시 유지');
       catalog = data; catalogAt = Date.now();catalogRetryAt=0;
       catalogETag=String(response.responseHeaders||'').match(/^etag:\s*(.+)$/im)?.[1]?.trim()||'';
-      GM_setValue(CATALOG_KEY,{at:catalogAt,etag:catalogETag,data:catalog});syncEggs();observeFeed();schedulePaint();
+      GM_setValue(CATALOG_KEY,{at:catalogAt,etag:catalogETag,data:catalog});syncEggs();syncSkinsCatalog();observeFeed();schedulePaint();
     } catch (error) { catalogRetryAt=Date.now()+60000;report(error.message); }
   }
   function loadLive() {
@@ -1109,7 +1176,7 @@
     })().finally(()=>livePromise=null);return livePromise;
   }
   function schedulePaint() {
-    if(!panel || panel.hidden || paintTimer!==null)return;
+    if(!panel || (panel.hidden && cropPanel?.hidden) || paintTimer!==null)return;
     paintTimer=setTimeout(()=>{paintTimer=null;refresh();},350);
   }
   function setAutoBuy(value) {
@@ -1405,12 +1472,12 @@
     }
     report(`알 심기 종료 · 밭에 빈칸 없음${done ? ` · ${done}개 심음` : ''}`);
   }
-  async function storePurchased(job,item,purchased,heldBefore) {
+  async function storePurchased(job,item,purchased,heldBefore,enabled=()=>settings.autoStore) {
     if(acquiredOutsideBag(game.data(),item,meta(item.itemType,itemId(item)))>0 &&
       !game.data().inventory.items.some(i=>i?.itemType===item.itemType && itemId(i)===itemId(item)))
       return item.itemType==='Tool'?'도구 고리 지급 확인':'게임 보관함 설치 확인';
     let moved=0;
-    while(moved<purchased && settings.autoStore) {
+    while(moved<purchased && enabled()) {
       checkJob(job);
       const plan=storagePlan(game.data(),item,purchased-moved,heldBefore,catalog.decor?.[STORAGE_FOR[item.itemType]]);
       if(!plan.storage)return [moved?`보관함 ${moved}개 이동`:'',plan.reason].filter(Boolean).join(' · ');
@@ -1426,6 +1493,74 @@
   function currentStandingSlot() {
     const native=nativeGameTeams.location(game.selfId,game.root);
     return standingPlantSlot(game.root,game.selfId,native?.map,native?native.position:game.localPosition ?? undefined);
+  }
+  function currentDecorCell() {
+    const native=nativeGameTeams.location(game.selfId,game.root);
+    return decorStandingCell(game.root,game.selfId,native?.map,native?native.position:game.localPosition ?? undefined);
+  }
+  function readDecor(data,target) {
+    const garden=data.garden;
+    if(target.edge)return garden?.edgeObjects?.[target.key]?.[target.part];
+    return garden?.[TILE_LISTS[target.tileType]]?.[target.slot];
+  }
+  async function pickupDecor(mode) {
+    await run('decor',async job=>{
+      await loadCatalog();
+      if(mode==='standing')await nativeGameTeams.connect();
+      checkJob(job);
+      const cell=mode==='standing'?currentDecorCell():null;
+      if(mode==='standing'&&!cell)throw Error('내 정원의 회수할 칸에 서서 다시 눌러 주세요.');
+      const selection=settings.decorPickup.selected;
+      if(['selected','other'].includes(mode)&&!Object.values(selection).some(Boolean))
+        throw Error('상세 페이지에서 장식 종류를 하나 이상 골라 주세요.');
+      const targets=decorPickupTargets(game.data().garden,cell).filter(target=>{
+        if(mode==='crops')return !!target.cropId;
+        if(mode==='selected')return selection[target.id]===true;
+        if(mode==='other')return selection[target.id]!==true;
+        return true;
+      });
+      if(!targets.length){report('회수할 장식이나 받침대 작물이 없습니다.');return;}
+      let decors=0,crops=0,stored=0,storageMessage='';
+      const verifyJob=()=>{
+        checkJob(job);
+        if(cell && JSON.stringify(currentDecorCell())!==JSON.stringify(cell))throw Error('서 있는 칸이 바뀌어 회수를 중단했습니다.');
+      };
+      const summary=()=>`장식 ${decors}개 · 받침대 작물 ${crops}개${stored?` · 장식창고 ${stored}개 수납`:''}${storageMessage?` · ${storageMessage}`:''}`;
+      try{
+        for(const target of targets) {
+          verifyJob();
+          const tileArgs={tileType:target.tileType,localTileIndex:target.slot};
+          const sameDecor=current=>current?.decorId===target.id && (target.edge?current.mirrored===target.mirrored:current.rotation===target.rotation);
+          let data=game.data(),current=readDecor(data,target);
+          if(!sameDecor(current))continue;
+          if(!target.edge && current.mountedCrop) {
+            if(typeof target.cropId!=='string'||!target.cropId||current.mountedCrop.id!==target.cropId)continue;
+            if(inventoryBagCount(data.inventory)>=100)throw Error('인벤토리 가득 참');
+            const alreadyHeld=data.inventory.items.some(item=>item?.id===target.cropId);
+            if(alreadyHeld)throw Error('받침대 작물과 인벤토리 상태가 일치하지 않습니다.');
+            await game.command('PickupDisplayedCrop',tileArgs,next=>
+              readDecor(next,target)?.mountedCrop?.id!==target.cropId && next.inventory.items.some(item=>item?.itemType==='Produce'&&item.id===target.cropId),
+              12000,{stateConfirms:true});
+            crops++;
+          }
+          if(mode==='crops')continue;
+          verifyJob();data=game.data();current=readDecor(data,target);
+          if(!sameDecor(current)||current.mountedCrop)continue;
+          const item={itemType:'Decor',decorId:target.id},held=purchaseCapacity(data,item).held;
+          if(!held && inventoryBagCount(data.inventory)>=100)throw Error('인벤토리 가득 참');
+          const type=target.edge?'PickupEdgeDecor':'PickupDecor';
+          const args=target.edge?{edge:target.edge,side:target.side,part:target.part}:tileArgs;
+          await game.command(type,args,next=>!readDecor(next,target) && purchaseCapacity(next,item).held>held,12000,{stateConfirms:true});
+          decors++;
+          if(settings.decorPickup.autoStore) {
+            const note=await storePurchased(job,item,1,held,()=>settings.decorPickup.autoStore);
+            if(note==='보관함 1개 이동')stored++;else if(note)storageMessage=note;
+          }
+          report(`회수 진행 · ${summary()}`);
+        }
+      }catch(error){throw Error(`회수 중단 · ${summary()} · ${error.message}`);}
+      report(`회수 완료 · ${summary()}`);
+    });
   }
   async function standingCrop(job,action) {
     await nativeGameTeams.connect();checkJob(job);
@@ -1543,6 +1678,51 @@
     } finally {
       if (restore && (changed || settings.teams.restore !== 'current')) await applyTeam(restore,job,true);
     }
+  }
+  function sellCrops() {
+    if(running){report('진행 중인 작업이 끝난 뒤 실행하세요.');return;}
+    if(!settings.teams.cropSell) {
+      panel.hidden=false;
+      const existing=shadow.querySelector('.crop-preset-dialog');
+      if(existing){existing.querySelector('button').focus();return;}
+      const overlay=el('div',{class:'overlay crop-preset-dialog',role:'dialog',ariaLabel:'작물 판매 프리셋 필요'});
+      const setup=button('설정 열기',()=>{overlay.remove();go('settings');content.querySelector('[data-preset="cropSell"]')?.focus();},'primary');
+      overlay.append(el('div',{class:'dialog'},el('h2',{text:'작물 판매 프리셋을 추가하세요'}),el('p',{text:'설정의 작물 프리셋에서 판매에 사용할 펫 팀을 선택해 주세요.'}),el('div',{class:'actions'},button('닫기',()=>overlay.remove()),setup)));
+      overlay.addEventListener('keydown',event=>{if(event.key==='Escape')overlay.remove();});
+      shadow.append(overlay);setup.focus();return;
+    }
+    void run('cropSell',async job=>{
+      if(!unprotectedProduce(game.data().inventory).length){report('판매할 잠금 해제 작물이 없습니다.');return;}
+      let sales=0;
+      try{
+        await withTeam('cropSell',job,async()=>{
+          while(true) {
+            checkJob(job);
+            const data=game.data(),{inventory}=data,items=unprotectedProduce(inventory);
+            if(!items.length)return;
+            if(items.some(item=>typeof item.id!=='string'||!item.id))throw Error('작물 식별 정보 확인 대기');
+            const ids=new Set(items.map(item=>item.id));
+            report(`작물 판매 중 · 남은 작물 ${items.length}개`);
+            // Native bulk sell respects favorite IDs. If any alternate lock
+            // flag exists without the corresponding native lock, stop safely.
+            if(inventory.items.some(item=>item?.itemType==='Produce' &&
+              (foodLocked(inventory,item) || inventory.favoritedItemIds.includes(item.species)) &&
+              !inventory.favoritedItemIds.includes(item.id)))
+              throw Error('잠긴 작물의 게임 잠금 상태가 확인되지 않아 판매를 중단했습니다.');
+            const previousLogs=new Set((data.activityLogs||[]).filter(log=>log?.action==='sellAllCrops').map(log=>JSON.stringify(log)));
+            await game.command('SellAllCrops',{},next=>{
+              const remaining=new Set(next.inventory.items.filter(item=>item?.itemType==='Produce').map(item=>item.id));
+              return [...ids].some(id=>!remaining.has(id)) || (next.activityLogs||[]).some(log=>
+                log?.action==='sellAllCrops' && log.parameters?.cropsSold?.some(item=>ids.has(item?.id)) && !previousLogs.has(JSON.stringify(log)));
+            },12000,{stateConfirms:true});
+            sales++;
+            // A native sale can return saved produce in a separate state update.
+            await sleep(300);
+          }
+        });
+      }catch(error){throw Error(`작물 판매 ${sales}회 확인 · ${error.message}`);}
+      report(`작물 판매 완료 · ${sales}회`);
+    });
   }
   function hatchAll() { void hatch(); }
   async function hatchOne(job,target) {
@@ -1676,6 +1856,7 @@
   }
   function refresh(force = false) {
     if (!content) return;
+    if(cropPanel && !cropPanel.hidden){renderCropManager();placeWindow(cropPanel,cropPanelPosition);}
     syncSkinsControl();placeCropIcon();
     shadow.querySelector('.connection').textContent=game.root?'● 연결됨':'○ 연결 대기';
     shadow.querySelector('.stop').hidden=!running;
@@ -1683,32 +1864,35 @@
     // Team options must still follow server patches while a select or text field
     // has focus. Update these controls in place without discarding the user's edit.
     if(view==='settings')syncTeamControls();
-    if(view==='crops' && content.querySelector('.crop-manager')){renderCropManager();placePanel();return;}
     // Background work must not replace an input while the user is editing it.
     if (!force && (dragEgg || (content.contains(shadow.activeElement) && ['INPUT','SELECT'].includes(shadow.activeElement?.tagName)))) return;
     lastPaint=Date.now(); content.replaceChildren();
     panel.classList.toggle('home',view==='home');
-    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',cleanse:'변이 지우기',locks:'인벤토리 잠금',crops:'작물 관리',settings:'설정' };
+    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',cleanse:'변이 지우기',locks:'인벤토리 잠금',decor:'장식 회수',settings:'설정' };
     shadow.querySelector('.page-name').textContent=names[view];
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
-      if(homePage===0)for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['feed','펫 먹이','🍽️'],['settings','설정','⚙️']]) {
+      if(homePage===0)for (const [key,name,glyph] of [['buy','상점 구매','🛒'],['plant','알 심기','🥚'],['hatch','알 부화','🐣'],['sell','펫 판매','🐾'],['feed','펫 먹이','🍽️']]) {
         const control=key==='feed'?switchFor(settings.autoFeed,setAutoFeed,'펫 먹이 자동 지급'):key==='buy' ? switchFor(settings.autoBuy,setAutoBuy,'입고 시 구매') :
-          button(key==='plant'?'심기':key==='hatch'?'부화':key==='sell'?'판매':'⚙️',() => key==='plant'?void run('plant',plant):key==='hatch'?hatchAll():key==='sell'?void sell():go('settings'),'pill');
+          button(key==='plant'?'심기':key==='hatch'?'부화':'판매',() => key==='plant'?void run('plant',plant):key==='hatch'?hatchAll():void sell(),'pill');
         if(key==='hatch')control.disabled=!!running;
         content.append(el('div',{ class:'menu-row' },button(`${glyph}  ${name}`,()=>go(key),'menu-link'),control));
       }
-      if(homePage===1)content.append(el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),
-        switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')),
-        el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')),
+      if(homePage===1)content.append(
+        el('div',{class:'menu-row'},button('🏡 작물 관리',()=>openCropManager(),'menu-link'),switchFor(settings.cropManager.iconVisible,v=>{settings.cropManager.iconVisible=v;placeCropIcon();},'작물 관리 아이콘 표시')),
         el('div',{class:'menu-row'},button('🫧 변이 지우기',()=>go('cleanse'),'menu-link'),button('지우기',()=>cleanseStanding('selected'),'pill')),
-        el('div',{class:'menu-row'},button('🔒 인벤토리 잠금',()=>go('locks'),'menu-link'),button('잠금',()=>go('locks'),'pill')),
-        el('div',{class:'menu-row'},button('🏡 작물 관리',()=>go('crops'),'menu-link'),switchFor(settings.cropManager.iconVisible,v=>{settings.cropManager.iconVisible=v;placeCropIcon();},'작물 관리 아이콘 표시')));
-      content.append(el('nav',{class:'rooms',ariaLabel:'방 이동'},...settings.rooms.map(({name,room})=>
-        el('a',{text:name,href:`https://magicgarden.gg/r/${room}`,title:`${room} 방으로 이동`} ))));
-      const previous=button('◀',()=>{homePage=0;refresh(true);});previous.setAttribute('aria-label','이전 메뉴 페이지');previous.disabled=homePage===0;
-      const next=button('▶',()=>{homePage=1;refresh(true);});next.setAttribute('aria-label','다음 메뉴 페이지');next.disabled=homePage===1;
-      content.append(el('nav',{class:'menu-pages',ariaLabel:'메뉴 페이지 전환'},previous,el('span',{text:`${homePage+1} / 2`}),next));
+        el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')),
+        el('div',{class:'menu-row'},button('🧺 작물 판매',sellCrops,'menu-link'),button('판매',sellCrops,'pill')),
+        el('div',{class:'menu-row'},button('🔒 인벤토리 잠금',()=>go('locks'),'menu-link'),button('잠금',()=>go('locks'),'pill')));
+      if(homePage===2)content.append(
+        el('div',{class:'menu-row'},button('📷 숨기기',openSkins,'menu-link'),switchFor(!!skinsAPI()?.getConfig?.().enabled,setSkinsEnabled,'스킨·숨기기 전체 적용')),
+        el('div',{class:'menu-row'},button('🪑 장식 회수',()=>go('decor'),'menu-link'),button('회수',()=>void pickupDecor('standing'),'pill')));
+      const previous=button('◀',()=>{homePage=(homePage+2)%3;refresh(true);});previous.setAttribute('aria-label','이전 메뉴 페이지');
+      const next=button('▶',()=>{homePage=(homePage+1)%3;refresh(true);});next.setAttribute('aria-label','다음 메뉴 페이지');
+      content.append(el('nav',{class:'menu-pages',ariaLabel:'메뉴 페이지 전환'},previous,el('span',{text:`${homePage+1} / 3`}),next),
+        el('div',{class:'menu-bottom'},button('⚙️  설정',()=>go('settings'),'menu-link'),
+          el('nav',{class:'rooms',ariaLabel:'방 이동'},...settings.rooms.map(({name,room})=>
+            el('a',{text:name,href:`https://magicgarden.gg/r/${room}`,title:`${room} 방으로 이동`})))));
       syncSkinsControl();
     } else {
       if (view==='buy') renderBuy();
@@ -1717,7 +1901,7 @@
       if (view==='sell') renderSell();
       if (view==='feed') renderFeed();
       if (view==='locks') renderInventoryLocks();
-      if (view==='crops') renderCropManager();
+      if (view==='decor') renderDecorPickup();
       if (view==='pot') renderPot();
       if (view==='cleanse') renderCleanse();
       if (view==='settings') renderSettings();
@@ -1779,6 +1963,11 @@
     return url?el('img',{src:url,alt:name,title:name,loading:'lazy',onerror:e=>e.target.replaceWith(el('span',{text:name,title:name}))}):el('span',{text:id==='missing'?'❌':id==='size100'?'📏':id==='CropCleanser'?'🫧':name,title:name});
   }
   let cropManagerUI=null;
+  let cropPanelPosition=null;
+  function openCropManager(toggle=false) {
+    cropPanel.hidden=toggle?!cropPanel.hidden:false;
+    if(!cropPanel.hidden){renderCropManager();placeWindow(cropPanel,cropPanelPosition);}
+  }
   function renderCropManager() {
     const options=settings.cropManager;
     if(!cropManagerUI?.root.isConnected) {
@@ -1786,7 +1975,7 @@
       const crops=el('details',{class:'shop-category',open:options.cropsOpen}),goals=el('details',{class:'shop-category',open:options.goalsOpen});
       const cropSummary=el('span',{text:'대상 작물'}),choices=el('div',{class:'category-body'});
       crops.append(el('summary',{},cropSummary),choices);goals.append(el('summary',{text:'완료 조건'}));
-      for(const [key,details] of [['cropsOpen',crops],['goalsOpen',goals]])details.addEventListener('toggle',()=>{if(!details.isConnected)return;settings.cropManager[key]=details.open;save();placePanel();});
+      for(const [key,details] of [['cropsOpen',crops],['goalsOpen',goals]])details.addEventListener('toggle',()=>{if(!details.isConnected)return;settings.cropManager[key]=details.open;save();placeWindow(cropPanel,cropPanelPosition);});
       const conditions=el('div',{class:'category-body'}),checks=new Map();
       for(const [name,ids] of [['색 변이',['Rainbow','Gold']],['기상',['Thundercharged','Thunderstruck','Wet','Chilled','Frozen']],['달 변이',['Ambercharged','Ambershine','Dawncharged','Dawnlit']]]) {
         const group=el('div',{class:'goal-options'});
@@ -1804,7 +1993,7 @@
       conditions.append(el('div',{class:'goal-row'},el('small',{text:'크기'}),el('div',{class:'goal-options'},el('label',{},sizeCheck,monitorIcon('size100','크기')),size,'이상')),
         el('small',{text:'같은 줄은 하나만 충족해도 됩니다. 켜 둔 줄은 모두 충족해야 완료입니다. 선택된 목표가 모든 대상 열매에 적용되면 초록색으로 표시합니다.'}));goals.append(conditions);
       root.append(stats,total,notice,crops,goals,el('small',{text:'내 밭의 실제 열매만 집계합니다. 자동 수확·세정·포션 사용은 하지 않습니다. ❌ 조건 미달 · 🫧 강화로 해결할 수 없어 Crop Cleanser가 필요한 열매(보존 열매 제외).'}));
-      content.append(root);cropManagerUI={root,stats,total,notice,crops,goals,cropSummary,choices,checks,size,choiceSignature:'',resultSignature:''};
+      cropContent.append(root);cropManagerUI={root,stats,total,notice,crops,goals,cropSummary,choices,checks,size,choiceSignature:'',resultSignature:''};
     }
     const ui=cropManagerUI;
     let data=null;try{data=game.data();}catch{}
@@ -1878,6 +2067,33 @@
       const toggle=switchFor(!!settings.cleanse.selected[id],on=>settings.cleanse.selected[id]=on,`${name} 변이 선택`);
       toggle.querySelector('input').disabled=!!running;
       content.append(row(name,toggle));
+    }
+  }
+  function renderDecorPickup() {
+    let placed=[];
+    try{placed=decorPickupTargets(game.data().garden);}catch{}
+    const counts=new Map();
+    for(const target of placed)counts.set(target.id,(counts.get(target.id)||0)+1);
+    const popupAction=(label,mode,primary=false)=>{
+      const control=button(label,()=>void pickupDecor(mode),primary?'primary':'');
+      control.disabled=!!running;
+      return control;
+    };
+    content.append(
+      row('장식창고 자동 수납',switchFor(settings.decorPickup.autoStore,value=>{settings.decorPickup.autoStore=value;},'장식창고 자동 수납')),
+      el('div',{class:'pot-actions'},popupAction('선택한 장식 회수','selected',true),popupAction('선택 제외하고 회수','other')),
+      el('div',{class:'pot-actions'},popupAction('받침대 작물 모두 회수','crops')),
+      el('small',{text:'상세 버튼은 내 정원 전체에 적용합니다. 받침대를 회수할 때 위에 놓인 작물부터 인벤토리로 옮깁니다.'})
+    );
+    const ids=journalOrder(catalog,'Decor',[...counts.keys(),...Object.keys(settings.decorPickup.selected).filter(id=>settings.decorPickup.selected[id])]);
+    if(!ids.length)content.append(el('p',{text:'내 정원에 배치된 장식이 없습니다.'}));
+    for(const id of ids) {
+      const input=el('input',{type:'checkbox',ariaLabel:`${title('Decor',id)} 회수 선택`,checked:settings.decorPickup.selected[id]===true,disabled:!!running,onchange:event=>{
+        if(event.target.checked)settings.decorPickup.selected[id]=true;
+        else delete settings.decorPickup.selected[id];
+        save();
+      }});
+      content.append(el('label',{class:'row pot-crop'},input,itemLabel('Decor',id,`배치 ${counts.get(id)||0}개`)));
     }
   }
   function renderPot() {
@@ -2075,7 +2291,7 @@
   }
   function teamOptions(key,teams) {
     const options=(teams || []).map(t=>[t.id,`${t.manual?'직접 등록 · ':''}${typeof t.name==='string' && t.name.trim()?t.name:t.id}`]);
-    const opts=key==='restore'?[['current','현재 프리셋'],...options]:[['','변경 안 함'],...options];
+    const opts=key==='restore'?[['current','현재 프리셋'],...options]:[['',key==='cropSell'?'팀 선택':'변경 안 함'],...options];
     if(settings.teams[key]&&!opts.some(([id])=>id===settings.teams[key]))opts.push([settings.teams[key],teams===null?'팀 목록 확인 대기':'선택한 팀 확인 필요']);
     return opts;
   }
@@ -2114,7 +2330,7 @@
     if(!/^[\w:.-]{1,160}$/.test(id))throw Error('프리셋 ID 형식을 확인하세요.');
     if(!accountId)throw Error('내 계정 정보 확인 대기 · 프리셋 등록 보류');
     if(ids.length<1 || ids.length>3 || new Set(ids).size!==ids.length)throw Error('사용 중인 펫 1~3마리를 확인한 뒤 등록하세요.');
-    const names={hatch:'부화',sell:'판매',restore:'복구'};
+    const names={hatch:'부화',sell:'판매',cropSell:'작물 판매',restore:'복구'};
     const previous=settings.registeredTeams.find(t=>t.id===id && t.accountId===accountId);
     if(!previous && settings.registeredTeams.length>=60)throw Error('직접 등록 프리셋은 최대 60개입니다.');
     const record={id,accountId,name:previous?.name || (detected?.id===id && detected.name) || `${names[key]} 프리셋`,members:ids.map(petId=>({petId}))};
@@ -2128,7 +2344,7 @@
     details.addEventListener('toggle',()=>{if(details.isConnected){settings.manualTeamsOpen=details.open;save();placePanel();}});
     const body=el('div',{class:'category-body'});
     body.append(el('small',{text:'게임에서 원하는 펫 팀을 한 번 적용한 뒤, 해당 용도의 현재 프리셋 버튼을 누르세요. 팀 목록 없이도 등록할 수 있습니다.'}));
-    for(const [key,label] of [['hatch','부화'],['sell','판매'],['restore','복구']]) {
+    for(const [key,label] of [['hatch','부화'],['sell','판매'],['cropSell','작물 판매'],['restore','복구']]) {
       const input=el('input',{type:'text',ariaLabel:`${label} 프리셋 ID 직접 입력`,placeholder:'현재 팀 ID 또는 직접 입력',value:settings.teams[key]==='current'?'':settings.teams[key],maxLength:160});
       const apply=button('현재 프리셋',()=>{try{registerCurrentTeam(key);}catch(error){report(error.message);}});
       apply.setAttribute('aria-label',`${label} 현재 프리셋 등록`);
@@ -2160,6 +2376,11 @@
       const opts=teamOptions(key,teams),node=select(settings.teams[key],opts,v=>{settings.teams[key]=v;syncTeamControls();},name);
       node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
     }
+    content.append(el('h3',{text:'작물 프리셋'}));
+    const cropOptions=teamOptions('cropSell',teams);
+    const cropTeam=select(settings.teams.cropSell,cropOptions,value=>{settings.teams.cropSell=value;syncTeamControls();},'작물 판매 프리셋');
+    cropTeam.dataset.preset='cropSell';cropTeam.dataset.options=JSON.stringify(cropOptions);
+    content.append(row('작물 판매 프리셋',cropTeam));
     content.append(el('small',{class:'team-status'}),button('팀 목록 새로고침',()=>void refreshNativeTeams()));
     content.append(renderManualTeams());
     syncTeamControls();
@@ -2189,7 +2410,7 @@
   }
   function importSettings(text) {
     if(running)throw Error('진행 중인 작업이 끝난 뒤 설정을 불러오세요.');
-    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;clearFeeding();save();syncEggs();placeIcon();placeCropIcon();content.replaceChildren();refresh(true);report('모든 설정을 불러왔습니다.');
+    const next=parseSettings(text),wasBuy=settings.autoBuy;settings=next;clearFeeding();save();syncEggs();placeIcon();placeCropIcon();content.replaceChildren();cropContent.replaceChildren();refresh(true);report('모든 설정을 불러왔습니다.');
     if(!settings.autoBuy)pendingBuy.clear();
     if(settings.autoBuy&&!wasBuy){void loadCatalog();void loadLive();scheduleBuy();}
     if(settings.autoFeed)void loadCatalog().then(observeFeed);
@@ -2214,18 +2435,21 @@
     icon.style.top=`${Math.max(8,Math.min(innerHeight-52,p.top))}px`;
   }
   function placePanel() {
-    if(!panel || panel.hidden)return;
-    const rect=panel.getBoundingClientRect();
-    const p=settings.panelPosition || {left:innerWidth-rect.width-(innerWidth<520?12:76),top:Math.min(68,innerHeight*.08)};
-    panel.style.right='auto';
-    panel.style.left=`${Math.max(8,Math.min(innerWidth-rect.width-8,p.left))}px`;
-    panel.style.top=`${Math.max(8,Math.min(innerHeight-rect.height-8,p.top))}px`;
+    placeWindow(panel,settings.panelPosition);
   }
-  function enablePanelDrag(handle) {
+  function placeWindow(windowEl,position) {
+    if(!windowEl || windowEl.hidden)return;
+    const rect=windowEl.getBoundingClientRect();
+    const p=position || {left:windowEl===cropPanel?12:innerWidth-rect.width-(innerWidth<520?12:76),top:Math.min(68,innerHeight*.08)};
+    windowEl.style.right='auto';
+    windowEl.style.left=`${Math.max(8,Math.min(innerWidth-rect.width-8,p.left))}px`;
+    windowEl.style.top=`${Math.max(8,Math.min(innerHeight-rect.height-8,p.top))}px`;
+  }
+  function enablePanelDrag(handle,windowEl=panel,move=position=>{settings.panelPosition=position;placePanel();}) {
     let drag=null;
     handle.addEventListener('pointerdown',event=>{
       if(event.button!==0 || event.target.closest('button,input,select'))return;
-      const rect=panel.getBoundingClientRect();
+      const rect=windowEl.getBoundingClientRect();
       drag={id:event.pointerId,x:event.clientX,y:event.clientY,left:rect.left,top:rect.top,moved:false};
       handle.setPointerCapture(event.pointerId);event.preventDefault();
     });
@@ -2233,11 +2457,11 @@
       if(!drag || drag.id!==event.pointerId)return;
       const dx=event.clientX-drag.x,dy=event.clientY-drag.y;
       if(!drag.moved && Math.hypot(dx,dy)<4)return;
-      drag.moved=true;settings.panelPosition={left:drag.left+dx,top:drag.top+dy};placePanel();
+      drag.moved=true;move({left:drag.left+dx,top:drag.top+dy});
     });
     const finish=event=>{
       if(!drag || drag.id!==event.pointerId)return;
-      if(drag.moved){const rect=panel.getBoundingClientRect();settings.panelPosition={left:rect.left,top:rect.top};save();}
+      if(drag.moved){const rect=windowEl.getBoundingClientRect();move({left:rect.left,top:rect.top});if(windowEl===panel)save();}
       drag=null;if(handle.hasPointerCapture(event.pointerId))handle.releasePointerCapture(event.pointerId);
     };
     for(const type of ['pointerup','pointercancel','lostpointercapture'])handle.addEventListener(type,finish);
@@ -2248,12 +2472,14 @@
       :host{all:initial;color-scheme:dark;font:12px/1.45 system-ui,-apple-system,"Malgun Gothic",sans-serif;color:#e5e8e9}
       *{box-sizing:border-box}[hidden]{display:none!important}button,input,select{font:inherit;color:inherit}button{cursor:pointer;border:1px solid #ffffff24;background:#ffffff07;border-radius:5px;padding:5px 8px;transition:background .12s}button:hover{background:#ffffff13;border-color:#ffffff40}button:disabled{opacity:.4;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid #6caf84;outline-offset:2px}
       .icon{position:fixed;width:44px;height:44px;padding:0;border-radius:50%;background:#293229ed;color:#fff;font-size:24px;box-shadow:0 5px 18px #0005;z-index:2147483644;touch-action:none;user-select:none;cursor:grab}
-      .panel{position:fixed;right:76px;top:68px;width:340px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);display:flex;flex-direction:column;background:linear-gradient(135deg,#242821f5,#22262ef5);backdrop-filter:blur(16px);border:1px solid #ffffff1c;border-radius:8px;box-shadow:0 14px 40px #0005;z-index:2147483645;overflow:hidden}.panel.home{width:224px}
+      .panel,.crop-window{position:fixed;right:76px;top:68px;width:340px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);display:flex;flex-direction:column;background:linear-gradient(135deg,#242821f5,#22262ef5);backdrop-filter:blur(16px);border:1px solid #ffffff1c;border-radius:8px;box-shadow:0 14px 40px #0005;z-index:2147483645;overflow:hidden}.panel.home{width:224px}
       header{padding:9px 10px 0;flex:none;cursor:move;touch-action:none;user-select:none}.brand{display:flex;align-items:center;justify-content:space-between;gap:8px}.brand strong{font-size:13px;font-weight:650;flex:1;padding:5px 0;letter-spacing:-.2px}.brand button{font-size:17px;line-height:1;width:25px;height:25px;padding:0;color:#c7cccd;cursor:pointer}.badges{display:flex;align-items:center;gap:7px;margin:6px 0 8px}.badges span{font-size:11px;border:1px solid #4b8562;background:#32544044;border-radius:5px;padding:2px 6px;color:#e0eee5}.subhead{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid #ffffff16;cursor:default}.page-name{flex:1;font-size:12px;color:#aeb8b4}.home .subhead{padding:0;border-top:0}.home .page-name{display:none}.back{font-size:11px;padding:4px 8px}.stop{font-size:11px;color:#f0c8c2;border-color:#8c635f;margin:6px 10px;align-self:flex-end;flex:none}
       .body{padding:0 10px 9px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#ffffff28 transparent;min-height:0}.home .body{padding:4px 10px 8px;border-top:1px solid #ffffff16}.menu-row{display:flex;align-items:center;min-height:34px;gap:8px}.menu-link{flex:1;text-align:left;background:none;border:0;font-weight:500;padding:6px 0;border-radius:4px}.menu-link:hover{background:#ffffff06}.pill{font-size:12px;min-width:43px;padding:4px 7px;border:1px solid #ffffff25;background:#ffffff06}
       .row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #ffffff0d}.grow{flex:1;min-width:0}.label{font-weight:500;overflow-wrap:anywhere}small{display:block;font-size:11px;color:#97a39f;line-height:1.4;margin-top:2px}p{font-size:12px;color:#b1bab7;margin:7px 0 9px}h3{font-size:12px;color:#b7c9bf;margin:12px 0 4px;font-weight:600}h2{font-size:17px;margin-top:0}
       .manual-team-input{display:flex;gap:4px;flex:1;min-width:0}.manual-team-input input{width:0;flex:1}.manual-team-input button{flex:none;font-size:10px;padding:4px 5px}.manual-team-current{overflow-wrap:anywhere;padding:5px 0}.manual-teams .category-body>small{padding-top:5px}
-      .rooms{display:flex;gap:6px;padding-top:8px;margin-top:5px;border-top:1px solid #ffffff16}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
+      .menu-bottom>.menu-link{width:100%;margin-top:7px;border-top:1px solid #ffffff16}.crop-window>header{margin-bottom:8px}.crop-window .body{overflow:auto}
+      .crop-manager-icon{z-index:2147483646}
+      .rooms{display:flex;gap:6px;margin-top:4px}.rooms a{flex:1;text-align:center;color:#dce6df;text-decoration:none;padding:5px 0;border:1px solid #ffffff24;border-radius:4px;background:#ffffff07}.rooms a:hover{background:#ffffff13}
       .menu-pages{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid #ffffff16;margin-top:8px;padding-top:8px}.menu-pages button{padding:3px 13px}.menu-pages span{font-size:11px;color:#a7b7ad}.menu-pages button:disabled{opacity:.35;cursor:default}
       .pot-actions{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}.pot-actions button{flex:1;padding:6px 4px;white-space:nowrap}.pot-crop input{accent-color:#6caf84;flex:none;margin:0 3px}
       .feed-bulk{display:flex;flex-direction:column;gap:5px;margin:7px 0}.feed-bulk button{text-align:left}.room-fields{display:flex;flex-direction:column;gap:4px;width:175px;max-width:65%}.room-fields input{width:100%}
@@ -2276,7 +2502,7 @@
     icon.addEventListener('pointermove',e=>{if(!drag)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(!drag.moved&&Math.hypot(dx,dy)<4)return;drag.moved=true;settings.position={left:drag.left+dx,top:drag.top+dy};placeIcon();});
     const endDrag=e=>{if(!drag)return;suppressClick=drag.moved;if(drag.moved){const r=icon.getBoundingClientRect();settings.position={left:r.left,top:r.top};save();}drag=null;if(icon.hasPointerCapture(e.pointerId))icon.releasePointerCapture(e.pointerId);};
     icon.addEventListener('pointerup',endDrag);icon.addEventListener('pointercancel',endDrag);
-    cropIcon=button('🏡',()=>{if(!panel.hidden&&view==='crops')panel.hidden=true;else{panel.hidden=false;go('crops');}},'icon crop-manager-icon');
+    cropIcon=button('🏡',()=>openCropManager(true),'icon crop-manager-icon');
     cropIcon.setAttribute('aria-label','작물 관리 열기');enableCropIconDrag();
     content=el('main',{class:'body'});footer=el('footer',{role:'status','ariaLive':'polite',text:status});
     panel=el('section',{class:'panel',hidden:true,ariaLabel:'Original Snail'},el('header',{},
@@ -2285,7 +2511,12 @@
       el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}))),content,footer,
       button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed')setAutoFeed(false);if(running.kind==='buy')setAutoBuy(false);save();}report('현재 요청 확인 후 중지합니다.');},'stop'));
     enablePanelDrag(panel.querySelector('header'));
-    shadow.append(style,icon,cropIcon,panel);placeIcon();placeCropIcon();window.addEventListener('resize',()=>{placeIcon();placeCropIcon();placePanel();});refresh();void loadCatalog();
+    cropContent=el('main',{class:'body'});
+    const cropHeader=el('header',{},el('div',{class:'brand'},el('strong',{text:'🏡 작물 관리'}),button('×',()=>cropPanel.hidden=true)));
+    cropPanel=el('section',{class:'crop-window',hidden:true,ariaLabel:'작물 관리 창'},cropHeader,cropContent);
+    enablePanelDrag(cropHeader,cropPanel,position=>{cropPanelPosition=position;placeWindow(cropPanel,position);});
+    shadow.append(style,icon,cropIcon,panel,cropPanel);placeIcon();placeCropIcon();
+    window.addEventListener('resize',()=>{placeIcon();placeCropIcon();placePanel();placeWindow(cropPanel,cropPanelPosition);});refresh();void loadCatalog();
   }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',mount,{once:true});else mount();
 })();
@@ -3339,7 +3570,7 @@ var __esm = (fn, res) => function __init() {
 
 const APP_NAME = 'Snail with Skins';
 const CONFIG_KEY = 'snail-with-skins.v1';
-const DEFAULT_RULE = Object.freeze({ hidden:false, opacity:1, scale:1, imageId:null });
+const DEFAULT_RULE = Object.freeze({ hidden:false });
 const CATEGORIES = ['plant', 'mutation', 'mutation-overlay'];
 const ownKey = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -3360,15 +3591,7 @@ function validRule(raw) {
     if (typeof raw.hidden !== 'boolean') throw Error('숨기기 값이 잘못되었습니다.');
     rule.hidden = raw.hidden;
   }
-  for (const [key,min,max] of [['opacity',0,1],['scale',0.1,3]]) {
-    if (!ownKey(raw,key)) continue;
-    if (typeof raw[key] !== 'number' || !Number.isFinite(raw[key]) || raw[key]<min || raw[key]>max) throw Error('투명도 또는 크기 범위를 확인하세요.');
-    rule[key] = raw[key];
-  }
-  if (ownKey(raw,'imageId')) {
-    if (raw.imageId !== null && (typeof raw.imageId !== 'string' || !/^img-[a-z0-9-]+$/i.test(raw.imageId))) throw Error('이미지 정보가 잘못되었습니다.');
-    rule.imageId = raw.imageId;
-  }
+  // Prior releases also saved opacity, scale and uploaded image IDs.
   return rule;
 }
 function readConfig(raw) {
@@ -3379,7 +3602,8 @@ function readConfig(raw) {
     if (!raw[scope] || typeof raw[scope] !== 'object' || Array.isArray(raw[scope])) throw Error('설정 목록이 잘못되었습니다.');
     for (const [key,value] of Object.entries(raw[scope])) {
       if (scope === 'groups' ? !CATEGORIES.includes(key) : !categoryFor(key)) continue;
-      Object.defineProperty(out[scope], key, { value:validRule(value), enumerable:true, configurable:true, writable:true });
+      const rule=validRule(value);
+      if(ownKey(rule,'hidden'))Object.defineProperty(out[scope],key,{value:rule,enumerable:true,configurable:true,writable:true});
     }
   }
   return out;
@@ -3389,7 +3613,6 @@ function resolveRule(config, frameKey) {
   if (!category || !config.enabled) return { ...DEFAULT_RULE };
   return { ...DEFAULT_RULE, ...config.groups[category], ...config.objects[objectFor(frameKey)], ...config.frames[frameKey] };
 }
-function isEdited(rule) { return rule.hidden || rule.opacity !== 1 || rule.scale !== 1 || !!rule.imageId; }
 function rectOf(texture) { return texture?.frame ?? texture?._frame; }
 function sourceOfTexture(texture) { return texture?.source ?? texture?._source ?? texture?.baseTexture; }
 function rectSignature(rect) { return rect && [rect.x,rect.y,rect.width,rect.height].join('|'); }
@@ -3504,29 +3727,9 @@ function createMatcher(targets, cachedTextures, snapshots = new Map()) {
     return matches.length===1 ? matches[0] : null;
   };
 }
-function composeCanvas(target, image, rule) {
-  const canvas=document.createElement('canvas');
-  const hidden=rule.hidden || rule.opacity===0;
-  // Hidden frames need only one transparent texel; patchTexture preserves the
-  // original logical bounds. Avoid hundreds of full-size blank GPU images.
-  canvas.width=hidden?1:Math.max(1,Math.round(target.width*rule.scale));
-  canvas.height=hidden?1:Math.max(1,Math.round(target.height*rule.scale));
-  if (canvas.width*canvas.height>16*1024*1024) throw Error('이미지가 너무 큽니다. 크기를 줄여 주세요.');
-  const ctx=canvas.getContext('2d');
-  if (!ctx) throw Error('이미지 그리기를 사용할 수 없습니다.');
-  if (hidden) return canvas;
-  if (!image) throw Error('원본 이미지를 읽지 못했습니다. 다시 연결해 주세요.');
-  const fit=Math.min(canvas.width/image.width,canvas.height/image.height);
-  const w=image.width*fit,h=image.height*fit;
-  ctx.imageSmoothingEnabled=fit<1;
-  ctx.globalAlpha=rule.opacity;
-  ctx.drawImage(image,(canvas.width-w)/2,(canvas.height-h)/2,w,h);
-  return canvas;
-}
-
 // Keep pure configuration and texture operations directly testable in Node.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports={newConfig,readConfig,resolveRule,categoryFor,objectFor,createMatcher,patchTexture,restoreTexture,composeCanvas,bundleFromSpriteData,targetsFrom,atlasName};
+  module.exports={newConfig,readConfig,resolveRule,categoryFor,objectFor,createMatcher,patchTexture,restoreTexture,bundleFromSpriteData,targetsFrom,atlasName};
 } else {
   void bootSkins();
 }
@@ -3536,9 +3739,10 @@ async function bootSkins() {
   if (root.__SNAIL_WITH_SKINS__) return;
   const api={version:'1.0.0'};
   root.__SNAIL_WITH_SKINS__=api;
-  let config=newConfig(), targets=new Map(), selectedCategory='plant', selectedObject='', query='';
-  let database, ui, lastRenderer, revision=0, work=Promise.resolve(), applying=false;
-  let assets=new Map(), snapshots=new Map(), generated=new Map(), originals=new Map(), appliedNodes=new Set();
+  let config=newConfig(), targets=new Map(), selectedCategory='plant';
+  let ui, lastRenderer, revision=0, work=Promise.resolve(), applying=false;
+  const snapshots=new Map(),appliedNodes=new Set(),hiddenBaked=new Map();
+  let hiddenFrames=new Set(),transparent=null,catalog=null,plantRanks=new Map(),mutationOrder=[];
   let status='게임과 이미지 목록을 기다리는 중…', error='', cacheNotice='';
   try { const stored=localStorage.getItem(CONFIG_KEY); if (stored) config=readConfig(JSON.parse(stored)); }
   catch (e) { error=`저장된 설정을 불러오지 못했습니다: ${e.message}`; }
@@ -3552,6 +3756,21 @@ async function bootSkins() {
   let panelOpen=false,publishedEnabled=config.enabled;
   api.setPanelOpen=on=>{panelOpen=!!on;if(ui){ui.panel.hidden=!panelOpen;if(panelOpen)render();}};
   root.dispatchEvent(new Event('snail-with-skins:config-change'));
+  api.setCatalog=(data,orderedPlants)=>{
+    if(!data?.plants||data===catalog)return;
+    catalog=data;
+    plantRanks=new Map();
+    for(const [rank,id] of orderedPlants.entries()) {
+      const item=data.plants[id];
+      for(const url of [item?.crop?.sprite,item?.plant?.sprite,item?.plant?.immatureSprite,item?.plant?.activeState?.sprite]) {
+        if(!url)continue;
+        const frame=url.split('/').pop().split('?')[0].replace(/\.png$/i,'');
+        if(!plantRanks.has(frame))plantRanks.set(frame,rank);
+      }
+    }
+    mutationOrder=['Gold','Rainbow',...(data.enums?.mutationTierOrder || []),...Object.keys(data.mutations || {})];
+    if(ui&&!ui.panel.hidden)render();
+  };
   function save() {
     try { localStorage.setItem(CONFIG_KEY,JSON.stringify(config)); }
     catch (e) { throw Error(`설정을 저장하지 못했습니다: ${e.message}`); }
@@ -3567,41 +3786,6 @@ async function bootSkins() {
     const version=revision;
     work=work.then(()=>applyAll(version)).catch(report);
     return work;
-  }
-  async function openImages() {
-    database=await new Promise((resolve,reject)=>{
-      const request=indexedDB.open('snail-with-skins',1);
-      request.onupgradeneeded=()=>request.result.createObjectStore('images',{keyPath:'id'});
-      request.onsuccess=()=>resolve(request.result);
-      request.onerror=()=>reject(request.error);
-      request.onblocked=()=>reject(Error('다른 게임 탭을 닫고 다시 시도해 주세요.'));
-    });
-    return imageTransaction('readonly',store=>store.getAll());
-  }
-  function imageTransaction(mode,action) {
-    if (!database) return Promise.reject(Error('이미지 저장소가 준비되지 않았습니다. 다시 연결해 주세요.'));
-    return new Promise((resolve,reject)=>{
-      const tx=database.transaction('images',mode), req=action(tx.objectStore('images'));
-      tx.oncomplete=()=>resolve(req.result);
-      tx.onabort=tx.onerror=()=>reject(tx.error || req.error || Error('이미지를 저장하지 못했습니다.'));
-    });
-  }
-  async function upload(scope,key,file) {
-    if (!file) return;
-    if (file.size>4*1024*1024) throw Error('이미지는 4MB 이하로 선택해 주세요.');
-    const bitmap=await createImageBitmap(file);
-    if (bitmap.width*bitmap.height>16*1024*1024) { bitmap.close?.(); throw Error('이미지 해상도가 너무 큽니다.'); }
-    const id=`img-${crypto.randomUUID()}`;
-    try { await imageTransaction('readwrite',store=>store.put({id,blob:file})); }
-    catch (e) { bitmap.close?.(); throw e; }
-    assets.set(id,bitmap);
-    config[scope][key]={...config[scope][key],imageId:id};
-    change(); render();
-    // Images no longer referenced by any setting are reclaimed after a successful save.
-    const used=new Set(['groups','objects','frames'].flatMap(s=>Object.values(config[s]).map(r=>r.imageId)).filter(Boolean));
-    for (const [old,image] of assets) if (!used.has(old)) {
-      await imageTransaction('readwrite',store=>store.delete(old)); image.close?.(); assets.delete(old);
-    }
   }
   function cacheTexture(key) {
     const Texture=getSpriteState().ctors?.Texture;
@@ -3631,22 +3815,31 @@ async function bootSkins() {
       else node.onViewUpdate?.();
     } catch (_) {}
   }
-  function rebake() {
+  function renderCache() {
     const state=getSpriteState();
-    const queue=[getPixiApp(),state.app,state.renderer,root.__PIXI_APP__,root.app];
-    const seen=new Set();
-    while (queue.length && seen.size<400) {
-      const holder=queue.shift();
-      if (!holder || typeof holder!=='object' || seen.has(holder)) continue;
-      seen.add(holder);
-      const cache=holder.renderTextureCache,rebake=cache?.rebakeAll || cache?.evictIdleAndRebake;
-      if (typeof rebake==='function') {
-        rebake.call(cache);cacheNotice='';return true;
-      }
-      for (const key of ['app','engine','game','renderer','stage','_app','quinoa']) if (holder[key]) queue.push(holder[key]);
+    return [getPixiApp(),state.app,state.renderer].find(holder=>holder?.renderTextureCache)?.renderTextureCache;
+  }
+  function rebake() {
+    const cache=renderCache(),update=cache?.rebakeAll || cache?.evictIdleAndRebake;
+    if(typeof update==='function'){update.call(cache);cacheNotice='';}
+    else cacheNotice='합성된 이미지의 갱신이 늦을 수 있습니다.';
+  }
+  function applyBakedColors(nodes) {
+    const colors=['Gold','Rainbow'].filter(id=>resolveRule(config,'sprite/mutation/'+id).hidden);
+    const textures=new Set();
+    if(colors.length)for(const entry of renderCache()?.snapshotEntries?.() || []) {
+      const match=/^sprite\/(?:plant|tall-plant|crop)\/[^,]+-([a-z,]+)$/i.exec(entry.key);
+      if(match && match[1].split(',').some(id=>colors.includes(id)))textures.add(entry.texture);
     }
-    cacheNotice='변이 합성 캐시를 찾지 못했습니다. 이미 합성된 변이 식물은 변경이 늦게 보일 수 있습니다.';
-    return false;
+    const activeNodes=new Set(nodes);
+    for(const [node,visible] of hiddenBaked)if(node.destroyed||!activeNodes.has(node)||!textures.has(node.texture)){
+      if(!node.destroyed)node.visible=visible;
+      hiddenBaked.delete(node);
+    }
+    for(const node of nodes)if(textures.has(node.texture)){
+      if(!hiddenBaked.has(node))hiddenBaked.set(node,node.visible);
+      node.visible=false;
+    }
   }
   function restoreAll() {
     const failed=[];
@@ -3656,76 +3849,51 @@ async function bootSkins() {
     for (const node of appliedNodes) poke(node);
     appliedNodes.clear();
     if (failed.length) throw failed[0];
-    // GPU sources may only be released after all users of them are restored.
-    for (const entry of generated.values()) entry.texture.destroy?.(true);
-    generated.clear();
-  }
-  async function originalImage(target) {
-    if (originals.has(target.key)) return originals.get(target.key);
-    const state=getSpriteState();
-    let texture=state.tex.get(target.key) || cacheTexture(target.key);
-    if(!texture){const match=createMatcher(targets,new Map());texture=walkSprites().map(node=>node.texture).find(t=>match(t)?.key===target.key);}
-    if ((!texture || !state.renderer?.extract) && target.apiImage) {
-      const bitmap=await createImageBitmap(await getBlob2(target.apiImage));
-      try{const canvas=document.createElement('canvas');canvas.width=bitmap.width;canvas.height=bitmap.height;canvas.getContext('2d').drawImage(bitmap,0,0);originals.set(target.key,canvas);return canvas;}finally{bitmap.close?.();}
-    }
-    if (!texture || !state.renderer?.extract) return null;
-    const sprite=new state.ctors.Sprite(texture);
-    try {
-      const extracted=await state.renderer.extract.canvas(sprite,{resolution:1});
-      // Extract can return a pooled canvas; keep an independent copy.
-      const canvas=document.createElement('canvas');canvas.width=extracted.width;canvas.height=extracted.height;
-      canvas.getContext('2d').drawImage(extracted,0,0);
-      originals.set(target.key,canvas);return canvas;
-    } finally {sprite.destroy?.({texture:false,baseTexture:false});}
+    for(const [node,visible] of hiddenBaked)if(!node.destroyed)node.visible=visible;
+    hiddenBaked.clear();
+    api.appliedTextures=0;
+    transparent?.destroy?.(true);transparent=null;
   }
   async function applyAll(version) {
     if (!api.ready || version!==revision) return;
-    applying=true; error='';renderStatus();
+    applying=true;error='';renderStatus();
     try {
       restoreAll();
-      if (!config.enabled) {rebake();status='전체 적용 OFF · 원래 모습으로 표시합니다.';return;}
-      const state=getSpriteState();
-      for (const target of targets.values()) {
-        const rule=resolveRule(config,target.key);
-        if (!isEdited(rule)) continue;
-        const image=rule.imageId ? assets.get(rule.imageId) : rule.hidden || rule.opacity===0 ? null : await originalImage(target);
-        if (version!==revision) return;
-        if (rule.imageId && !image && !rule.hidden && rule.opacity!==0) throw Error('저장된 스킨 이미지를 읽지 못했습니다. 이미지를 다시 선택해 주세요.');
-        const canvas=composeCanvas(target,image,rule);
-        const texture=state.ctors.Texture.from(canvas);
-        generated.set(target.key,{texture,canvas,rule});
+      if(!config.enabled){rebake();status='전체 적용 OFF · 원래 모습으로 표시합니다.';return;}
+      hiddenFrames=new Set([...targets.keys()].filter(key=>resolveRule(config,key).hidden));
+      if(hiddenFrames.size) {
+        const canvas=document.createElement('canvas');canvas.width=canvas.height=1;
+        transparent=getSpriteState().ctors.Texture.from(canvas);
       }
-      if (version!==revision) return;
-      applyDiscovered();
-      if (!generated.size) status='전체 적용 ON · 기본 게임 이미지로 표시합니다.';
-    } finally { applying=false;renderStatus(); }
+      // Restore the baked images even when the last hidden frame was cleared.
+      status='전체 적용 ON · 숨김 적용 0개';
+      const updated=applyDiscovered();if(!updated)rebake();
+    } finally {applying=false;renderStatus();}
   }
   function applyDiscovered() {
-    if (!config.enabled || !generated.size) return;
-    const cached=new Map();
-    for (const key of targets.keys()) {const texture=cacheTexture(key);if (texture) cached.set(key,texture);}
+    if(!config.enabled)return false;
+    if(!hiddenFrames.size&&!resolveRule(config,'sprite/mutation/Gold').hidden&&!resolveRule(config,'sprite/mutation/Rainbow').hidden)return false;
+    const nodes=walkSprites(),cached=new Map();
+    for(const key of hiddenFrames){const texture=cacheTexture(key);if(texture)cached.set(key,texture);}
     const match=createMatcher(targets,cached,snapshots);
-    const nodes=walkSprites();
     const candidates=new Set([...cached.values(),...nodes.map(n=>n.texture)]);
-    const catalog=new Set(getSpriteState().tex.values());
+    const catalogTextures=new Set(getSpriteState().tex.values());
     let changed=false;
-    for (const texture of candidates) {
-      if (snapshots.has(texture) || catalog.has(texture) || texture.destroyed) continue;
-      const target=match(texture), entry=target && generated.get(target.key);
-      if (!entry) continue;
-      const snapshot=patchTexture(texture,sourceOfTexture(entry.texture),entry.canvas,entry.rule.scale);
-      if (snapshot) {snapshots.set(texture,snapshot);changed=true;}
+    for(const texture of candidates) {
+      if(snapshots.has(texture)||catalogTextures.has(texture)||texture.destroyed)continue;
+      const target=match(texture);
+      if(!target||!hiddenFrames.has(target.key)||!transparent)continue;
+      const snapshot=patchTexture(texture,sourceOfTexture(transparent),{width:1,height:1},1);
+      if(snapshot){snapshots.set(texture,snapshot);changed=true;}
     }
-    for (const node of nodes) if (snapshots.has(node.texture)) {if (!appliedNodes.has(node)) poke(node);appliedNodes.add(node);}
-    for (const node of appliedNodes) if (node.destroyed || !node.parent) appliedNodes.delete(node);
-    for (const texture of snapshots.keys()) if (texture.destroyed) snapshots.delete(texture);
-    if (changed) rebake();
-    api.appliedTextures=snapshots.size;
-    status=generated.size && !snapshots.size
-      ? `전체 적용 ON · ${generated.size}개 프레임 준비됨 · 게임에 표시될 때 적용합니다.`
-      : `전체 적용 ON · ${generated.size}개 프레임 설정 · ${snapshots.size}개 텍스처에 적용`;
-    renderStatus();
+    for(const node of nodes)if(snapshots.has(node.texture)){if(!appliedNodes.has(node))poke(node);appliedNodes.add(node);}
+    for(const node of appliedNodes)if(node.destroyed||!node.parent)appliedNodes.delete(node);
+    for(const texture of snapshots.keys())if(texture.destroyed)snapshots.delete(texture);
+    if(changed)rebake();
+    applyBakedColors(nodes);
+    api.appliedTextures=snapshots.size+hiddenBaked.size;
+    status='전체 적용 ON · 숨김 적용 '+api.appliedTextures+'개';
+    renderStatus();return changed;
   }
   async function connect() {
     try {
@@ -3741,18 +3909,12 @@ async function bootSkins() {
   }
   await new Promise(resolve=>{if (document.body) resolve();else document.addEventListener('DOMContentLoaded',resolve,{once:true});});
   mountUI();
-  try {
-    const rows=await openImages();
-    for (const row of rows) {
-      try {assets.set(row.id,await createImageBitmap(row.blob));} catch (_) {error='일부 저장된 이미지를 읽지 못했습니다. 다시 선택해 주세요.';}
-    }
-  } catch(e) {report(e);}
   void connect();
   setInterval(()=>{
     if (!api.ready || applying) return;
     const current=getSpriteState().renderer;
     if (current && current!==lastRenderer) {
-      lastRenderer=current;originals.clear();revision++;queueApply();
+      lastRenderer=current;revision++;queueApply();
     } else {
       try {applyDiscovered();} catch(e) {report(e);}
     }
@@ -3774,20 +3936,16 @@ async function bootSkins() {
     const header=element('header');header.append(element('strong',APP_NAME),button('닫기',()=>api.setPanelOpen(false)));
     const toggle=button('',()=>api.setEnabled(!config.enabled),'master');toggle.setAttribute('role','switch');
     const tabs=element('nav');
-    for (const c of CATEGORIES) tabs.append(button(c==='plant'?'Plant':c==='mutation'?'Mutation':'Mutation-overlay',()=>{selectedCategory=c;selectedObject='';render();}));
-    const help=element('p','개별 프레임 > 개별 식물/변이 > 전체 설정 · 투명도 100%는 완전 투명','hint');
-    const global=element('div',undefined,'global'), search=element('input');search.type='search';search.placeholder='이름 검색';search.setAttribute('aria-label','이름 검색');
-    search.oninput=()=>{query=search.value;renderList();};
-    const list=element('div',undefined,'list'), detail=element('div',undefined,'detail');
-    const browser=element('div',undefined,'browser');browser.append(search,list);
-    const panes=element('div',undefined,'panes');panes.append(browser,detail);
+    for (const c of CATEGORIES) tabs.append(button(c==='plant'?'작물':c==='mutation'?'변이':'변이 효과',()=>{selectedCategory=c;list.scrollTop=0;render();}));
+    const global=element('div',undefined,'global'),list=element('div',undefined,'list');
     const statusEl=element('div',undefined,'status');statusEl.setAttribute('role','status');statusEl.setAttribute('aria-live','polite');
     const footer=element('footer');footer.append(button('다시 적용',()=>{revision++;queueApply();}),button('전체 설정 초기화',()=>{
       if (!window.confirm('전체 스킨 설정을 초기화할까요?')) return;
       config=newConfig();change();render();
     }));
-    panel.append(header,toggle,tabs,help,global,panes,statusEl,footer);shadow.append(panel);
-    ui={host,shadow,panel,toggle,tabs,global,list,detail,statusEl};render();
+    panel.append(header,toggle,tabs,global,list,statusEl,footer);shadow.append(panel);
+    ui={host,shadow,panel,toggle,tabs,global,list,statusEl};
+    enableDrag(panel,header);render();
     shadow.addEventListener('keydown',event=>{if (event.key==='Escape') {api.setPanelOpen(false);document.querySelector('#snail-in-cherry')?.shadowRoot?.querySelector('.menu-link')?.focus();}});
   }
   function renderStatus() {
@@ -3799,98 +3957,108 @@ async function bootSkins() {
     ui.toggle.classList.toggle('on',config.enabled);
 
   }
-  function groups() {
-    const result=new Map();
-    for (const t of targets.values()) if (t.category===selectedCategory) {
-      if (!result.has(t.object)) result.set(t.object,[]);result.get(t.object).push(t);
+  function enableDrag(panel,header) {
+    let position=null,drag=null;
+    function place() {
+      if(panel.hidden)return;
+      const rect=panel.getBoundingClientRect(),p=position || {left:innerWidth-rect.width-12,top:12};
+      panel.style.left=Math.max(8,Math.min(innerWidth-rect.width-8,p.left))+'px';
+      panel.style.top=Math.max(8,Math.min(innerHeight-rect.height-8,p.top))+'px';
     }
-    return [...result].sort((a,b)=>a[0].localeCompare(b[0],undefined,{numeric:true}));
+    header.onpointerdown=event=>{
+      if(event.button!==0||event.target.closest('button'))return;
+      const rect=panel.getBoundingClientRect();
+      drag={id:event.pointerId,x:event.clientX-rect.left,y:event.clientY-rect.top};
+      header.setPointerCapture(event.pointerId);
+    };
+    header.onpointermove=event=>{
+      if(!drag||event.pointerId!==drag.id)return;
+      position={left:event.clientX-drag.x,top:event.clientY-drag.y};place();
+    };
+    for(const type of ['pointerup','pointercancel','lostpointercapture'])header.addEventListener(type,()=>{drag=null;});
+    window.addEventListener('resize',place);ui.place=place;
   }
-  function name(key) {return key.split('/').pop();}
-  function renderList() {
+  const imageName=key=>key.split('/').pop().replace(/[_-]\d+$/,'');
+  function previews() {
+    const entries=new Map();
+    for(const target of targets.values())if(target.category===selectedCategory) {
+      if(!entries.has(target.object))entries.set(target.object,[]);
+      entries.get(target.object).push(target);
+    }
+    if(selectedCategory==='mutation')for(const id of ['Gold','Rainbow'])entries.set('sprite/mutation/'+id,[]);
+    const rank=key=>{
+      const art=imageName(key);
+      if(selectedCategory==='plant')return plantRanks.get(art)??Infinity;
+      const id=art.replace(/(?:TallPlant|Ground)$/,'').replace('Amberlit','Ambershine');
+      const index=mutationOrder.indexOf(id);return index<0?Infinity:index;
+    };
+    return [...entries].sort(([a],[b])=>rank(a)-rank(b)||a.localeCompare(b,undefined,{numeric:true}));
+  }
+  function renderList(entries,updateGroup) {
     ui.list.replaceChildren();
-    const filtered=groups().filter(([key])=>key.toLowerCase().includes(query.toLowerCase()));
-    if (!filtered.length) ui.list.append(element('p',api.ready?'검색 결과가 없습니다.':'게임 이미지 대기 중…','hint'));
-    for (const [key,slots] of filtered) {
-      const custom=ownKey(config.objects,key) || slots.some(t=>ownKey(config.frames,t.key));
-      const el=button(`${name(key)}${custom?' · 개별':''}`,()=>{selectedObject=key;renderList();renderDetail();},key===selectedObject?'selected':'');
-      el.title=key;ui.list.append(el);
+    if(!api.ready){ui.list.append(element('p','게임 이미지 대기 중…','hint'));return;}
+    const enabled={...config,enabled:true};
+    for(const [key,frames] of previews()) {
+      const id=imageName(key),label=catalog?.mutations?.[id]?.name || id;
+      const colorImage=['Gold','Rainbow'].includes(id)?'https://mg-api.ariedam.fr/assets/sprites/ui/Mutation'+id+'.png':'';
+      const imageUrl=frames.find(frame=>frame.apiImage)?.apiImage || catalog?.mutations?.[id]?.sprite || colorImage ||
+        'https://mg-api.ariedam.fr/assets/sprites/'+(selectedCategory==='plant'?'plants':'mutations')+'/'+encodeURIComponent(id)+'.png';
+      const hidden=(frames.length?frames:[{key}]).every(frame=>resolveRule(enabled,frame.key).hidden);
+      const control=button('',()=>{
+        const next=control.getAttribute('aria-pressed')!=='true';
+        config.objects[key]={hidden:next};
+        for(const frame of frames)delete config.frames[frame.key];
+        change();updateGroup();
+        control.classList.toggle('selected',next);
+        control.setAttribute('aria-pressed',String(next));
+      },hidden?'selected':'');
+      control.setAttribute('aria-label',label+' 숨기기');
+      control.setAttribute('aria-pressed',String(hidden));
+      control.title=label;
+      const img=element('img');img.src=imageUrl;img.alt=label;img.loading='lazy';
+      img.onerror=()=>{img.replaceWith(element('span',label,'missing-image'));};
+      control.append(img);ui.list.append(control);
     }
   }
   function render() {
-    if (!ui) return;
-    [...ui.tabs.children].forEach((el,i)=>{el.classList.toggle('selected',CATEGORIES[i]===selectedCategory);el.setAttribute('aria-pressed',String(CATEGORIES[i]===selectedCategory));});
-    ui.global.replaceChildren(element('h3',`${selectedCategory==='plant'?'Plant (작물·식물) 전체':selectedCategory+' 전체'} 설정`));
-    ui.global.append(ruleEditor('groups',selectedCategory,null));
-    renderList();renderDetail();renderStatus();
-  }
-  function renderDetail() {
-    ui.detail.replaceChildren();
-    const entry=groups().find(([key])=>key===selectedObject);
-    if (!entry) {ui.detail.append(element('p','이름을 선택하면 개별 설정과 성장 단계별 스킨을 변경할 수 있습니다.','hint'));return;}
-    const [key,slots]=entry;
-    ui.detail.append(element('h3',name(key)),ruleEditor('objects',key,slots[0].key));
-    if (slots.length>1) ui.detail.append(element('p','성장 단계 / 프레임별 설정','hint'));
-    for (const target of slots) {
-      const block=element('details');block.open=slots.length===1;
-      block.append(element('summary',`${name(target.key)} · ${target.width}×${target.height}`));
-      block.append(ruleEditor('frames',target.key,target.key));
-      ui.detail.append(block);
-    }
-  }
-  function ruleEditor(scope,key,frameKey) {
-    const box=element('div',undefined,'editor');
-    const inherited=scope!=='groups' && !ownKey(config[scope],key);
-    const enabledConfig={...config,enabled:true};
-    const effective=scope==='groups' ? {...DEFAULT_RULE,...config.groups[key]} : scope==='objects' ? {...DEFAULT_RULE,...config.groups[categoryFor(key)],...config.objects[key]} : resolveRule(enabledConfig,frameKey);
-    if (scope!=='groups') {
-      const row=element('label',undefined,'check'), check=element('input');check.type='checkbox';check.checked=!inherited;
-      check.onchange=()=>{
-        if (check.checked) config[scope][key]={...effective};else delete config[scope][key];
-        change();render();
-      };
-      row.append(check,element('span',scope==='objects'?'개별 설정 사용 (전체보다 우선)':'이 프레임만 설정 (가장 우선)'));box.append(row);
-    }
-    const fields=element('fieldset');fields.disabled=inherited;
-    const hideLabel=element('label',undefined,'check'), hide=element('input');hide.type='checkbox';hide.checked=effective.hidden;
-    hide.onchange=()=>update({hidden:hide.checked});hideLabel.append(hide,element('span','숨기기'));fields.append(hideLabel);
-    slider('투명도',Math.round((1-effective.opacity)*100),0,100,1,value=>({opacity:Number((1-value/100).toFixed(2))}));
-    slider('크기',Math.round(effective.scale*100),10,300,5,value=>({scale:value/100}));
-    const imageRow=element('div',undefined,'image-row');
-    const file=element('input');file.type='file';file.accept='image/png,image/webp,image/jpeg,image/gif';file.hidden=true;
-    file.onchange=()=>{const selected=file.files[0];void upload(scope,key,selected).catch(report);file.value='';};
-    const pick=button(effective.imageId?'스킨 이미지 바꾸기':'스킨 이미지 추가',()=>file.click());
-    imageRow.append(pick,file,button('기본 이미지',()=>{update({imageId:null});render();}));
-    fields.append(imageRow,element('p',effective.imageId?'추가한 스킨에도 숨기기·투명도·크기가 적용됩니다.':'기본 게임 이미지에 숨기기·투명도·크기가 적용됩니다.','hint'));
-    if (frameKey && assets.has(effective.imageId)) {
-      const target=targets.get(frameKey),preview=composeCanvas(target,assets.get(effective.imageId),{...effective,scale:1});preview.className='preview';fields.append(preview);
-    }
-    if (scope==='groups') fields.append(button('이 전체 설정 초기화',()=>{delete config.groups[key];change();render();}));
-    box.append(fields);return box;
-    function update(patch) {
-      config[scope][key]={...config[scope][key],...patch};change();
-      if (scope==='groups') renderDetail();
-    }
-    function slider(label,value,min,max,step,patch) {
-      const row=element('label',undefined,'slider'),text=element('span',label),output=element('output',`${value}%`),input=element('input');
-      input.type='range';input.min=min;input.max=max;input.step=step;input.value=value;input.setAttribute('aria-label',label);
-      input.oninput=()=>output.textContent=`${input.value}%`;
-      input.onchange=()=>update(patch(Number(input.value)));
-      row.append(text,input,output);fields.append(row);
-    }
+    if(!ui)return;
+    [...ui.tabs.children].forEach((node,i)=>{
+      const active=CATEGORIES[i]===selectedCategory;
+      node.classList.toggle('selected',active);node.setAttribute('aria-pressed',String(active));
+    });
+    const check=element('input');check.type='checkbox';
+    const entries=previews();
+    const total=entries.flatMap(([key,frames])=>frames.length?frames.map(frame=>frame.key):[key]);
+    const updateGroup=()=>{
+      const enabled={...config,enabled:true};
+      const hidden=total.filter(key=>resolveRule(enabled,key).hidden).length;
+      check.checked=total.length>0 && hidden===total.length;
+      check.indeterminate=hidden>0 && !check.checked;
+    };
+    updateGroup();
+    check.onchange=()=>{
+      config.groups[selectedCategory]={hidden:check.checked};
+      for(const [key,frames] of entries){delete config.objects[key];for(const frame of frames)delete config.frames[frame.key];}
+      change();render();
+    };
+    const label=element('label',undefined,'check');label.append(check,'이 범주 모두 숨기기');
+    ui.global.replaceChildren(label);
+    if(selectedCategory==='mutation')ui.global.append(element('p','Gold·Rainbow는 해당 변이 작물 전체를 숨깁니다.','hint'));
+    renderList(entries,updateGroup);renderStatus();ui.place();
   }
 }
 
 const SKINS_CSS = `
-:host{all:initial;font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#e8ecf1;position:fixed;z-index:2147483646;right:18px;bottom:20px;color-scheme:dark}
-*{box-sizing:border-box} [hidden]{display:none!important}
-button,input{font:inherit}button{cursor:pointer;border:1px solid #40534d;border-radius:9px;padding:7px 11px;background:#24332d;color:#e8ecf1;transition:background .12s}button:hover{background:#334d40}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid #b5e79f;outline-offset:2px}
-.launcher{background:#bedc9b;color:#1c2c20;font-weight:750;box-shadow:0 4px 22px #0007;padding:11px 16px}.launcher.off{background:#777f79;color:white}
-.panel{position:absolute;right:0;bottom:54px;width:min(850px,calc(100vw - 24px));height:min(820px,calc(100dvh - 100px));display:flex;flex-direction:column;background:#17231e;border:1px solid #536b59;border-radius:16px;box-shadow:0 16px 60px #0009;overflow:hidden;padding:16px;gap:10px}
-header{display:flex;align-items:center;justify-content:space-between;gap:10px}header strong{font-size:20px;letter-spacing:-.4px}header button{font-size:12px}.master{font-weight:800;background:#3b4540}.master.on{background:#b4d88d;color:#17281b;border-color:#b4d88d}nav{display:flex;gap:6px;flex-wrap:wrap}.selected{background:#536c46!important;color:#f1ffe8!important;border-color:#a5c08b!important}
-p,h3{margin:0}h3{font-size:14px;font-weight:750}.hint{font-size:12px;color:#acb9ae}.global{background:#202f26;border-radius:10px;padding:10px}.global .editor fieldset{display:grid;grid-template-columns:100px 1fr 1fr;gap:8px 16px;align-items:center}.global .image-row,.global .hint{grid-column:1/-1}.global fieldset>button{grid-column:1/-1;justify-self:start;font-size:12px}
-.panes{display:grid;grid-template-columns:210px 1fr;gap:12px;min-height:100px;flex:1;overflow:hidden}.browser{display:flex;flex-direction:column;gap:8px;min-height:0}.browser input{width:100%;border:1px solid #40534d;border-radius:8px;background:#101b16;color:#f2f6ed;padding:8px}.list{overflow:auto;display:flex;flex-direction:column;gap:5px;min-height:0;padding:2px}.list button{text-align:left;overflow-wrap:anywhere;font-size:13px}.detail{overflow:auto;background:#122019;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px}.editor fieldset{border:0;margin:0;padding:7px 0;min-width:0;display:flex;flex-direction:column;gap:10px}.editor fieldset:disabled{opacity:.42}.check{display:flex;gap:7px;align-items:center;font-size:13px}.check input{accent-color:#bedc9b}.slider{display:grid;grid-template-columns:50px minmax(60px,1fr) 45px;gap:6px;align-items:center;font-size:12px}.slider input{width:100%;accent-color:#c8e9a5}.slider output{text-align:right;font-variant-numeric:tabular-nums}.image-row{display:flex;gap:6px;flex-wrap:wrap}.image-row button{font-size:12px}.preview{width:72px;height:72px;object-fit:contain;image-rendering:pixelated;background:repeating-conic-gradient(#425045 0 25%,#25342b 0 50%) 0/14px 14px;border-radius:7px}details{border-top:1px solid #324539;padding-top:8px}summary{cursor:pointer;font-size:12px;overflow-wrap:anywhere}.status{font-size:12px;color:#b6c5b4;white-space:pre-line;max-height:75px;overflow:auto}.status.error{color:#ffc1ab}footer{display:flex;justify-content:space-between;gap:8px}footer button{font-size:12px}
-@media(max-width:600px){:host{right:12px;bottom:14px}.panel{padding:12px;gap:8px}.panes{grid-template-columns:125px 1fr;gap:7px}.detail{padding:9px}.global .editor fieldset{grid-template-columns:1fr}.global .image-row,.global .hint,.global fieldset>button{grid-column:auto}.global .editor fieldset>.hint{display:none}header strong{font-size:18px}nav button{padding:6px 8px;font-size:12px}.list button{padding:7px;font-size:12px}.slider{grid-template-columns:40px minmax(40px,1fr) 38px;gap:3px}}
+:host{all:initial;font:13px/1.4 system-ui,sans-serif;color:#e8ecf1;position:fixed;right:12px;bottom:12px;z-index:2147483646;color-scheme:dark}
+*{box-sizing:border-box}[hidden]{display:none!important}
+button,input{font:inherit;color:inherit}button{cursor:pointer;border:1px solid #ffffff2b;border-radius:5px;padding:5px 8px;background:#ffffff0a}button:hover{background:#ffffff1a}button:focus-visible,input:focus-visible{outline:2px solid #b5e79f;outline-offset:2px}
+.panel{position:fixed;width:min(450px,calc(100vw - 16px));max-height:calc(100dvh - 16px);display:flex;flex-direction:column;gap:8px;overflow:auto;background:#242b25;border:1px solid #ffffff2b;border-radius:8px;padding:10px;box-shadow:0 12px 42px #0008}
+header{display:flex;align-items:center;justify-content:space-between;cursor:move;touch-action:none;user-select:none}header strong{font-size:14px}
+.master.on,.selected{background:#42674b;border-color:#98c8a5}nav,footer{display:flex;gap:6px;flex-wrap:wrap}
+.list{display:grid;grid-template-columns:repeat(auto-fill,minmax(47px,1fr));gap:5px;max-height:min(52dvh,380px);overflow:auto;padding:3px}
+.list button{display:grid;place-items:center;aspect-ratio:1;padding:3px;position:relative;min-width:0}.list button.selected:after{content:'✓';position:absolute;right:3px;bottom:0;color:#d6ffd8}
+.list img{width:100%;height:38px;object-fit:contain;image-rendering:pixelated}.missing-image{font-size:8px;overflow-wrap:anywhere}
+.hint,.status{color:#b8c5b9;font-size:11px}.status.error{color:#ffc1ab}.status{white-space:pre-line}.check{display:flex;align-items:center;gap:6px}
 `;
 
 })();
