@@ -2,8 +2,8 @@
 // @name         Original Snail
 // @namespace    Original Snail
 // @author       0_"
-// @version      1.9.0
-// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·스킨과 설정 백업
+// @version      1.9.1
+// @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·작물 보존·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
 // @match        https://magicgarden.gg/r/*
@@ -30,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.9.0', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.9.1', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -765,6 +765,33 @@
   const foodLockKey=(inventory,item)=>item?.itemType==='Tool' && inventory.favoritedItemIds?.includes(item.toolId)?item.toolId:
     (typeof item?.id==='string' && item.id?item.id:item?.itemType==='Tool'?item.toolId:null);
 
+  function preservationCost(slot,catalog) {
+    const crop=catalog.plants?.[slot.species]?.crop;
+    if(!finite(crop?.baseSellPrice)||!finite(crop.maxSizeMultiplier)||!finite(slot.size)||!Array.isArray(slot.mutations))return null;
+    const modifiers=slot.mutations.map(id=>catalog.mutations?.[id]);
+    if(modifiers.some(m=>!finite(m?.coinMultiplier)||!m.group))return null;
+    // Native v2162 preservation uses the unbonused produce sale price.
+    const growth=modifiers.find(m=>m.group==='Growth')?.coinMultiplier ?? 1;
+    const weather=1+modifiers.reduce((sum,m)=>sum+(m.group==='Growth'?0:m.coinMultiplier-1),0);
+    const progress=(Math.min(100,Math.max(50,Math.round(slot.size)))-50)/50;
+    const price=Math.round(crop.baseSellPrice*(1+(crop.maxSizeMultiplier-1)*progress)*(growth*weather));
+    return Number.isSafeInteger(price)&&price>=0?price:null;
+  }
+  const pottedPlants=inventory=>inventory?.items?.filter(item=>item?.itemType==='Plant'&&typeof item.species==='string') || [];
+  const plantLocked=(inventory,plant)=>foodLocked(inventory,plant)||inventory.favoritedItemIds?.includes(plant.species);
+  const preservableFruit=(slot,now)=>!!growSlotStamp(slot)&&Number.isInteger(slot.slotId)&&slot.slotId>=0&&
+    slot.preserved!==true&&slot.locked!==true&&slot.isLocked!==true&&finite(slot.endTime)&&slot.endTime<=now;
+  function atPreservationStation(position,map) {
+    if(!Number.isInteger(position?.x)||!Number.isInteger(position?.y))return false;
+    if(map?.locations && Number.isInteger(map.cols)) {
+      const {x,y}=position;
+      return x>=0 && x<map.cols && y>=0 && (!finite(map.rows)||y<map.rows) &&
+        map.locations.preservationStation?.activationTilesIdxs?.includes(y*map.cols+x)===true;
+    }
+    // Activation area of the standard v2162 map when the native map is unavailable.
+    return position.x>=67&&position.x<=71&&position.y>=26&&position.y<=29;
+  }
+
   // Read-only fruit goals. Display names differ from the server mutation IDs.
   const FRUIT_MUTATION_NAMES={Gold:'Gold',Rainbow:'Rainbow',Wet:'Wet',Chilled:'Chilled',Frozen:'Frozen',Thunderstruck:'Thunderstruck',Thundercharged:'Thundercharged',Dawnlit:'Dawnlit',Dawncharged:'Dawnbound',Ambershine:'Amberlit',Ambercharged:'Amberbound'};
   const FRUIT_MUTATION_ALIASES={Amberlit:'Ambershine',Amberbound:'Ambercharged',Dawnbound:'Dawncharged'};
@@ -872,6 +899,7 @@
       this.shopWatch = new Map();
       this.serverClock=null;
       this.localPosition=null;
+      this.manualSelectionRevision=0;
       this.nativeTeamAttempt=null;this.lastNativeTeam=null;
     }
     install() {
@@ -895,6 +923,7 @@
               msg.commandSequence=seq;payload = JSON.stringify(msg);
             }
             const command=msg.type==='QuinoaCommand'?msg.command:msg;
+            if(command?.type==='SetSelectedItem' && !link.pending.has(msg.requestId))link.manualSelectionRevision++;
             if(command?.type==='ApplyPetTeam' && typeof command.teamId==='string' && command.teamId && !link.pending.has(msg.requestId)) {
               const data=link.data(),known=nativeTeams(data)?.find(t=>t.id===command.teamId);
               link.nativeTeamAttempt={id:command.teamId,requestId:msg.requestId,sequence:msg.commandSequence,at:Date.now(),ack:false,watermark:false,touched:false,before:activeIds(data),expected:known?members(known):null};
@@ -1594,6 +1623,104 @@
       report(done?'화분 담기 완료 · 1개':'대상 작물이 바뀌어 담지 않았습니다.');
     });
   }
+  function preserveHere() {
+    const native=nativeGameTeams.location(game.selfId,game.root);
+    const slot=mySlot(game.root,game.selfId);
+    if(!atPreservationStation(native?native.position:game.localPosition ?? slot?.position ?? slot?.data?.position,native?.map))
+      throw Error('마을의 작물 보존소에 서서 다시 눌러 주세요.');
+  }
+  function heldItem() {
+    const held=mySlot(game.root,game.selfId)?.heldItem;
+    if(!held || (held.itemId!==null && typeof held.itemId!=='string') || !finite(held.decorRotation))
+      throw Error('손에 든 아이템 동기화 대기 · 게임에서 화분을 한 번 들어 주세요.');
+    return {itemId:held.itemId,decorRotation:held.decorRotation};
+  }
+  function selectPreservationItem(selection) {
+    return game.command('SetSelectedItem',selection,()=>{
+      const held=heldItem();
+      return held.itemId===selection.itemId&&held.decorRotation===selection.decorRotation;
+    },12000,{stateConfirms:true});
+  }
+  function preserveCrops(species) {
+    void run('preserve',async job=>{
+      await Promise.all([loadCatalog(),nativeGameTeams.connect()]);
+      checkJob(job);preserveHere();
+      const original=heldItem(),manualRevision=game.manualSelectionRevision;
+      const data=game.data(),{inventory}=data;
+      if(!Array.isArray(inventory.favoritedItemIds))throw Error('잠금 정보 동기화 대기');
+      const plants=pottedPlants(inventory).filter(plant=>species===undefined?plant.id===original.itemId:potGroup(plant.species,catalog)===species);
+      if(!plants.length)throw Error(species===undefined?'인벤토리의 화분에 담긴 작물을 손에 들어 주세요.':'선택한 종류의 화분 작물이 없습니다.');
+      const targets=[],now=game.serverNow()??Date.now();
+      const inventoryIds=inventory.items.map(item=>item?.id);
+      for(const plant of plants) {
+        if(plantLocked(inventory,plant))continue;
+        if(typeof plant.id!=='string'||!plant.id||inventoryIds.indexOf(plant.id)!==inventoryIds.lastIndexOf(plant.id)||!Array.isArray(plant.slots))
+          throw Error('화분의 개별 식별 정보 확인 대기');
+        const slotIds=plant.slots.map(slot=>slot?.slotId);
+        for(const slot of plant.slots.filter(fruit=>preservableFruit(fruit,now))) {
+          if(slotIds.indexOf(slot.slotId)!==slotIds.lastIndexOf(slot.slotId))throw Error('열매의 개별 식별 정보 확인 대기');
+          const cost=preservationCost(slot,catalog);
+          if(cost===null)throw Error('보존 비용을 확인할 수 없습니다. 작물 정보가 로드된 뒤 다시 시도하세요.');
+          targets.push({itemId:plant.id,plantStamp:JSON.stringify([plant.species,plant.plantedAt]),slotId:slot.slotId,stamp:growSlotStamp(slot),species:slot.species,cost});
+        }
+      }
+      if(!targets.length){report('보존할 열매가 없습니다. 잠긴 화분·열매, 이미 보존된 열매, 성장 중인 열매는 제외됩니다.');return;}
+      const total=targets.reduce((sum,target)=>sum+target.cost,0);
+      if(!Number.isSafeInteger(total)||!finite(data.coinsCount))throw Error('보존 비용 또는 코인 잔액 확인 대기');
+      if(data.coinsCount<total)throw Error(`잔액 부족 · 보존에 ${total.toLocaleString('ko-KR')}코인 필요`);
+      if(!await confirmAction('작물 보존 확인','작물을 보존할까요?',`화분 ${new Set(targets.map(t=>t.itemId)).size}개 · 열매 ${targets.length}개 · ${total.toLocaleString('ko-KR')}코인. 보존은 되돌릴 수 없습니다.`,'보존 진행')){
+        report('작물 보존 취소');return;
+      }
+
+      let active=original,lastRequested=null,done=0,skipped=0,actionError='',restoreError='';
+      const verify=()=>{
+        checkJob(job);preserveHere();
+        const held=heldItem();
+        if(game.manualSelectionRevision!==manualRevision||held.itemId!==active.itemId||held.decorRotation!==active.decorRotation)
+          throw Error('손에 든 아이템이 바뀌었습니다.');
+      };
+      const currentTarget=target=>{
+        const current=game.data(),inv=current.inventory;
+        if(!Array.isArray(inv.favoritedItemIds))throw Error('잠금 정보 동기화 대기');
+        const plant=pottedPlants(inv).find(item=>item.id===target.itemId);
+        if(!plant||JSON.stringify([plant.species,plant.plantedAt])!==target.plantStamp||plantLocked(inv,plant))return false;
+        const slot=plant.slots?.find(fruit=>fruit?.slotId===target.slotId);
+        if(!preservableFruit(slot,game.serverNow()??Date.now())||growSlotStamp(slot)!==target.stamp)return false;
+        if(preservationCost(slot,catalog)!==target.cost){throw Error('보존 비용이 바뀌었습니다. 다시 선택해 주세요.');}
+        if(!finite(current.coinsCount)||current.coinsCount<target.cost)throw Error('잔액 부족 · 작물 보존 중단');
+        return true;
+      };
+      try{
+        for(const target of targets) {
+          verify();
+          if(!currentTarget(target)){skipped++;continue;}
+          if(active.itemId!==target.itemId) {
+            lastRequested={itemId:target.itemId,decorRotation:0};
+            await selectPreservationItem(lastRequested);
+            active=lastRequested;
+            verify();
+            if(!currentTarget(target)){skipped++;continue;}
+          }
+          await game.command('Preserve',{itemId:target.itemId,growSlotIdx:target.slotId},next=>
+            next.inventory.items.some(item=>item?.itemType==='Plant'&&item.id===target.itemId&&
+              item.slots?.some(fruit=>fruit?.slotId===target.slotId&&fruit.species===target.species&&fruit.preserved===true)),
+            12000,{stateConfirms:true});
+          report(`작물 보존 · ${++done}/${targets.length}개 확인`);
+        }
+      }catch(error){actionError=error.message;}
+      if(lastRequested && job.generation===game.generation && game.manualSelectionRevision===manualRevision) {
+        try{
+          const held=heldItem();
+          if(held.itemId===lastRequested.itemId&&held.decorRotation===lastRequested.decorRotation&&
+            (held.itemId!==original.itemId||held.decorRotation!==original.decorRotation))
+            await selectPreservationItem(original);
+        }catch(error){restoreError=`손에 들었던 아이템 복구 실패 · ${error.message}`;}
+      }
+      const count=`열매 ${done}개${skipped?` · 제외 ${skipped}개`:''}`;
+      if(actionError||restoreError)throw Error(['작물 보존 중단',count,actionError,restoreError].filter(Boolean).join(' · '));
+      report(`작물 보존 완료 · ${count}`);
+    });
+  }
   function cleanseStanding(mode='selected') {
     void run('cleanse',async job=> {
       await loadCatalog();checkJob(job);
@@ -1868,7 +1995,7 @@
     if (!force && (dragEgg || (content.contains(shadow.activeElement) && ['INPUT','SELECT'].includes(shadow.activeElement?.tagName)))) return;
     lastPaint=Date.now(); content.replaceChildren();
     panel.classList.toggle('home',view==='home');
-    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',cleanse:'변이 지우기',locks:'인벤토리 잠금',decor:'장식 회수',settings:'설정' };
+    const names={ home:'내 정원',buy:'상점 구매',plant:'알 심기',hatch:'알 부화',sell:'펫 판매',feed:'펫 먹이',pot:'화분 담기',preserve:'작물 보존',cleanse:'변이 지우기',locks:'인벤토리 잠금',decor:'장식 회수',settings:'설정' };
     shadow.querySelector('.page-name').textContent=names[view];
     const back=shadow.querySelector('.back'); back.hidden=view==='home';
     if (view==='home') {
@@ -1882,6 +2009,7 @@
         el('div',{class:'menu-row'},button('🏡 작물 관리',()=>openCropManager(),'menu-link'),switchFor(settings.cropManager.iconVisible,v=>{settings.cropManager.iconVisible=v;placeCropIcon();},'작물 관리 아이콘 표시')),
         el('div',{class:'menu-row'},button('🫧 변이 지우기',()=>go('cleanse'),'menu-link'),button('지우기',()=>cleanseStanding('selected'),'pill')),
         el('div',{class:'menu-row'},button('🪴 화분 담기',()=>go('pot'),'menu-link'),button('담기',potStanding,'pill')),
+        el('div',{class:'menu-row'},button('🫙 작물 보존',()=>go('preserve'),'menu-link'),el('button',{type:'button',text:'보존',class:'pill',disabled:!!running,onclick:()=>preserveCrops()})),
         el('div',{class:'menu-row'},button('🧺 작물 판매',sellCrops,'menu-link'),button('판매',sellCrops,'pill')),
         el('div',{class:'menu-row'},button('🔒 인벤토리 잠금',()=>go('locks'),'menu-link'),button('잠금',()=>go('locks'),'pill')));
       if(homePage===2)content.append(
@@ -1901,6 +2029,7 @@
       if (view==='sell') renderSell();
       if (view==='feed') renderFeed();
       if (view==='locks') renderInventoryLocks();
+      if (view==='preserve') renderPreservation();
       if (view==='decor') renderDecorPickup();
       if (view==='pot') renderPot();
       if (view==='cleanse') renderCleanse();
@@ -1933,6 +2062,30 @@
       control.append(url?el('img',{src:url,alt:name,loading:'lazy',onerror:e=>e.target.hidden=true}):el('span',{text:'🌱'}),el('span',{class:'crop-name',text:name}),el('span',{text:state}),el('small',{text:`${group.locked}/${group.items.length}개 잠김`}));
       if(control.disabled)control.title=running?'작업 진행 중':group.invalid?'개별 아이템 ID 확인 필요':'잠금 정보 동기화 대기';
       grid.append(control);
+    }
+    content.append(grid);
+  }
+  function renderPreservation() {
+    content.append(el('p',{text:'마을의 작물 보존소에서 그림을 누르면 해당 종류의 화분에 담긴 열매를 모두 보존합니다.'}),
+      el('small',{text:'열매의 판매가만큼 코인이 듭니다. 잠긴 화분과 열매, 이미 보존된 열매, 성장 중인 열매는 제외합니다.'}));
+    let inventory;try{inventory=game.data().inventory;}catch{}
+    if(!inventory){content.append(el('p',{text:'인벤토리 동기화 대기'}));return;}
+    const groups=new Map(),now=game.serverNow()??Date.now();
+    for(const plant of pottedPlants(inventory)) {
+      const id=potGroup(plant.species,catalog);
+      if(!groups.has(id))groups.set(id,{count:0,ready:0});
+      const group=groups.get(id);group.count++;
+      if(!plantLocked(inventory,plant)&&Array.isArray(plant.slots))group.ready+=plant.slots.filter(slot=>preservableFruit(slot,now)).length;
+    }
+    if(!groups.size){content.append(el('p',{text:'인벤토리에 화분에 담긴 작물이 없습니다.'}));return;}
+    const grid=el('div',{class:'lock-grid'});
+    for(const id of journalOrder(catalog,'Produce',[...groups.keys()])) {
+      const {count,ready}=groups.get(id),name=title('Produce',id),url=sprite('Produce',id);
+      const control=el('button',{type:'button',class:'crop-lock',ariaLabel:`${name} 종류 보존`,
+        disabled:!!running||!ready||!Array.isArray(inventory.favoritedItemIds),onclick:()=>preserveCrops(id)},
+        url?el('img',{src:url,alt:'',loading:'lazy',onerror:e=>e.target.hidden=true}):el('span',{text:'🌱'}),
+        el('span',{class:'crop-name',text:name}),el('small',{text:`화분 ${count}개`}),el('small',{text:`열매 ${ready}개 가능`}));
+      control.dataset.species=id;grid.append(control);
     }
     content.append(grid);
   }
@@ -2416,14 +2569,18 @@
     if(settings.autoFeed)void loadCatalog().then(observeFeed);
   }
   function askRainbow(pets) {
+    return confirmAction('Rainbow 펫 판매 확인','Rainbow 펫이 포함되어 있어요',`이번 판매에 Rainbow ${pets.length}마리가 포함됩니다.`,
+      '판매 진행',pets.map(p=>p.name||title('Pet',p.petSpecies)));
+  }
+  function confirmAction(label,heading,description,action,items=[]) {
     panel.hidden=false;
     return new Promise(resolve=>{
-      const overlay=el('div',{class:'overlay',role:'dialog',ariaLabel:'Rainbow 펫 판매 확인'});
+      const overlay=el('div',{class:'overlay',role:'dialog',ariaLabel:label});
       const end=value=>{overlay.remove();resolve(value);};
-      const yes=button('판매 진행',()=>end(true),'primary');
+      const yes=button(action,()=>end(true),'primary');
       const no=button('취소',()=>end(false));
-      overlay.append(el('div',{class:'dialog'},el('h2',{text:'Rainbow 펫이 포함되어 있어요'}),el('p',{text:`이번 판매에 Rainbow ${pets.length}마리가 포함됩니다.`}),
-        el('ul',{},pets.map(p=>el('li',{text:p.name||title('Pet',p.petSpecies)}))),el('div',{class:'actions'},no,yes)));
+      overlay.append(el('div',{class:'dialog'},el('h2',{text:heading}),el('p',{text:description}),
+        items.length?el('ul',{},items.map(text=>el('li',{text}))):null,el('div',{class:'actions'},no,yes)));
       overlay.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();end(false);}if(e.key==='Tab'){e.preventDefault();(shadow.activeElement===no?yes:no).focus();}});
       shadow.append(overlay);no.focus();
     });
