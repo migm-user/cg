@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    Original Snail
 // @author       0_"
-// @version      1.9.2
+// @version      1.9.3
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·작물 보존·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -30,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.9.2', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.9.3', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -140,7 +140,7 @@
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
     feed: { potionDefault:true,allowLockedPotions:true,allowLockedCrops:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
-    cropManager: {iconVisible:false,iconPosition:null,minSize:100,selected:{},conditions:{...FRUIT_MONITOR_CONDITION_DEFAULTS},cropsOpen:false,goalsOpen:false,protectHarvest:true},
+    cropManager: {iconVisible:false,iconPosition:null,minSize:100,selected:{},conditions:{...FRUIT_MONITOR_CONDITION_DEFAULTS},cropsOpen:false,goalsOpen:false,protectHarvest:true,sortDirection:'asc'},
     pots: { selected: {} },
     decorPickup: { selected: {}, autoStore: false },
     cleanse: { selected: {} }, rooms: defaultRooms(false),
@@ -179,6 +179,10 @@
     if(raw.cropManager) {
       const source=raw.cropManager,target=s.cropManager;
       for(const key of ['iconVisible','cropsOpen','goalsOpen','protectHarvest'])bool(source,key,target);
+      if(own(source,'sortDirection')) {
+        if(!['asc','desc'].includes(source.sortDirection))throw Error('대상 작물 정렬 설정 오류');
+        target.sortDirection=source.sortDirection;
+      }
       if(own(source,'selected'))target.selected=dict(source.selected);
       if(own(source,'conditions')) {
         const values=dict(source.conditions);
@@ -2228,8 +2232,16 @@
     if(!cropManagerUI?.root.isConnected) {
       const root=el('div',{class:'crop-manager'}),stats=el('div',{class:'crop-stats'}),total=el('div',{class:'crop-total'}),notice=el('div',{class:'crop-info'});
       const crops=el('details',{class:'shop-category',open:options.cropsOpen}),goals=el('details',{class:'shop-category',open:options.goalsOpen});
-      const cropSummary=el('span',{text:'대상 작물'}),choices=el('div',{class:'category-body'});
-      crops.append(el('summary',{},cropSummary),choices);goals.append(el('summary',{text:'완료 조건'}));
+      const cropSummary=el('span',{text:'대상 작물'}),choices=el('div');
+      const sortButtons=[['asc','오름차순'],['desc','내림차순']].map(([direction,label])=>[direction,button(label,()=>{
+        settings.cropManager.sortDirection=direction;save();renderCropManager();
+      })]);
+      const bulk=el('div',{class:'pot-actions'},
+        button('모두 선택',()=>{for(const id of cropManagerUI.availableIds)settings.cropManager.selected[id]=true;save();renderCropManager();}),
+        button('모두 해제',()=>{settings.cropManager.selected={};save();renderCropManager();}));
+      crops.append(el('summary',{},cropSummary),el('div',{class:'category-body'},
+        el('div',{class:'pot-actions',role:'group',ariaLabel:'대상 작물 도감 순서'},sortButtons.map(([,control])=>control)),bulk,choices));
+      goals.append(el('summary',{text:'완료 조건'}));
       for(const [key,details] of [['cropsOpen',crops],['goalsOpen',goals]])details.addEventListener('toggle',()=>{if(!details.isConnected)return;settings.cropManager[key]=details.open;save();placeWindow(cropPanel,cropPanelPosition);});
       const conditions=el('div',{class:'category-body'}),checks=new Map();
       const protection=switchFor(options.protectHarvest,value=>{
@@ -2253,10 +2265,10 @@
       conditions.append(el('div',{class:'goal-row'},el('small',{text:'크기'}),el('div',{class:'goal-options'},el('label',{},sizeCheck,monitorIcon('size100','크기')),size,'이상')),
         el('small',{text:'같은 줄은 하나만 충족해도 됩니다. 켜 둔 줄은 모두 충족해야 완료입니다. 선택된 목표가 모든 대상 열매에 적용되면 초록색으로 표시합니다.'}));goals.append(conditions);
       const harvest=button('완료 작물 모두 수확',harvestCompletedCrops,'primary');
-      const stop=button('작물 수확 중지',stopCurrentJob,'crop-stop');
-      root.append(stats,total,notice,crops,goals,el('div',{class:'pot-actions'},harvest,stop),
-        el('small',{text:'❌ 조건 미달 · 🫧 강화로 해결할 수 없어 Crop Cleanser가 필요한 열매(보존 열매 제외).'}));
-      cropContent.append(root);cropManagerUI={root,stats,total,notice,crops,goals,cropSummary,choices,checks,size,protection,harvest,stop,choiceSignature:'',resultSignature:''};
+      const stop=el('div',{class:'pot-actions',hidden:true},button('작물 수확 중지',stopCurrentJob,'crop-stop'));
+      root.append(el('div',{class:'pot-actions'},harvest),stats,total,notice,crops,goals,
+        el('small',{text:'❌ 조건 미달 · 🫧 강화로 해결할 수 없어 Crop Cleanser가 필요한 열매(보존 열매 제외).'}),stop);
+      cropContent.append(root);cropManagerUI={root,stats,total,notice,crops,goals,cropSummary,choices,sortButtons,checks,size,protection,harvest,stop,choiceSignature:'',resultSignature:''};
     }
     const ui=cropManagerUI;
     ui.harvest.disabled=!!running;
@@ -2271,10 +2283,14 @@
     }
     const ids=ui.availableIds,signature=ui.availableSignature;
     // Keep selectors and focused number inputs intact when new garden data arrives.
-    if(ui.choiceSignature!==signature) {
-      ui.choiceSignature=signature;ui.choices.replaceChildren();ui.cropChecks=new Map();
-      ui.choices.append(el('div',{class:'pot-actions'},button('모두 선택',()=>{for(const id of ids)settings.cropManager.selected[id]=true;save();renderCropManager();}),button('모두 해제',()=>{settings.cropManager.selected={};save();renderCropManager();})));
-      for(const id of ids) {
+    if(ui.choiceSignature!==signature || ui.sortDirection!==options.sortDirection) {
+      ui.choiceSignature=signature;ui.sortDirection=options.sortDirection;ui.choices.replaceChildren();ui.cropChecks=new Map();
+      for(const [direction,control] of ui.sortButtons) {
+        const active=direction===options.sortDirection;
+        control.classList.toggle('primary',active);control.setAttribute('aria-pressed',String(active));
+      }
+      const ordered=options.sortDirection==='desc'?[...ids].reverse():ids;
+      for(const id of ordered) {
         const input=el('input',{type:'checkbox',checked:!!options.selected[id],ariaLabel:`${title('Produce',id)} 관리 대상`,onchange:e=>{settings.cropManager.selected[id]=e.target.checked;save();renderCropManager();}});ui.cropChecks.set(id,input);
         ui.choices.append(el('label',{class:'row pot-crop'},input,itemLabel('Produce',id,'')));
       }
@@ -2610,7 +2626,7 @@
     details.addEventListener('toggle',()=>{if(details.isConnected){settings.manualTeamsOpen=details.open;save();placePanel();}});
     const body=el('div',{class:'category-body'});
     body.append(el('small',{text:'게임에서 원하는 펫 팀을 한 번 적용한 뒤, 해당 용도의 현재 프리셋 버튼을 누르세요. 팀 목록 없이도 등록할 수 있습니다.'}));
-    for(const [key,label] of [['hatch','부화'],['sell','판매'],['cropSell','작물 판매'],['cropHarvest','작물 수확'],['restore','복구']]) {
+    for(const [key,label] of [['hatch','부화'],['sell','판매'],['cropHarvest','작물 수확'],['cropSell','작물 판매'],['restore','복구']]) {
       const input=el('input',{type:'text',ariaLabel:`${label} 프리셋 ID 직접 입력`,placeholder:'현재 팀 ID 또는 직접 입력',value:settings.teams[key]==='current'?'':settings.teams[key],maxLength:160});
       const apply=button('현재 프리셋',()=>{try{registerCurrentTeam(key);}catch(error){report(error.message);}});
       apply.setAttribute('aria-label',`${label} 현재 프리셋 등록`);
@@ -2643,7 +2659,7 @@
       node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
     }
     content.append(el('h3',{text:'작물 프리셋'}));
-    for(const [key,name] of [['cropSell','작물 판매 프리셋'],['cropHarvest','작물 수확 프리셋']]) {
+    for(const [key,name] of [['cropHarvest','작물 수확 프리셋'],['cropSell','작물 판매 프리셋']]) {
       const opts=teamOptions(key,teams),node=select(settings.teams[key],opts,value=>{settings.teams[key]=value;syncTeamControls();},name);
       node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
     }
