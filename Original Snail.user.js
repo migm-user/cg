@@ -2,7 +2,7 @@
 // @name         Original Snail
 // @namespace    Original Snail
 // @author       0_"
-// @version      1.9.1
+// @version      1.9.2
 // @description  독립 상점 구매·알 심기·부화·펫 판매·펫 먹이·화분 담기·변이 지우기·인벤토리 잠금·작물 관리·작물 보존·스킨과 설정 백업
 // @match        https://1227719606223765687.discordsays.com/*
 // @match        https://magiccircle.gg/r/*
@@ -30,7 +30,7 @@
 (function () {
   'use strict';
   // Preserve the namespace, storage keys and DOM bridge when renaming/updating.
-  const VERSION = '1.9.1', KEY = 'snail-in-cherry.settings.v1';
+  const VERSION = '1.9.2', KEY = 'snail-in-cherry.settings.v1';
   const API = 'https://mg-api.ariedam.fr';
   const FIELDS = { Seed: 'species', Egg: 'eggId', Tool: 'toolId', Decor: 'decorId' };
   const COLS = 20, ROWS = 10, CAPACITY = 98;
@@ -140,12 +140,12 @@
     autoBuy: false, autoStore: false, autoFeed: false, buy: {},
     feed: { potionDefault:true,allowLockedPotions:true,allowLockedCrops:true,allowed:{},openEggs:[],openPets:[],webhook:{enabled:false,url:''} },
     eggs: { order: [], enabled: {}, direction: '좌' },
-    cropManager: {iconVisible:false,iconPosition:null,minSize:100,selected:{},conditions:{...FRUIT_MONITOR_CONDITION_DEFAULTS},cropsOpen:false,goalsOpen:false},
+    cropManager: {iconVisible:false,iconPosition:null,minSize:100,selected:{},conditions:{...FRUIT_MONITOR_CONDITION_DEFAULTS},cropsOpen:false,goalsOpen:false,protectHarvest:true},
     pots: { selected: {} },
     decorPickup: { selected: {}, autoStore: false },
     cleanse: { selected: {} }, rooms: defaultRooms(false),
     protect: { gold: false, rainbow: false, str: false, threshold: 95 },
-    teams: { hatch: '', sell: '', cropSell: '', restore: 'current' },
+    teams: { hatch: '', sell: '', cropSell: '', cropHarvest: '', restore: 'current' },
     registeredTeams: [], manualTeamsOpen: false,
     webhook: { enabled: false, url: '' }, position: null, panelPosition: null, collapsedShops: []
   });
@@ -178,7 +178,7 @@
     }
     if(raw.cropManager) {
       const source=raw.cropManager,target=s.cropManager;
-      for(const key of ['iconVisible','cropsOpen','goalsOpen'])bool(source,key,target);
+      for(const key of ['iconVisible','cropsOpen','goalsOpen','protectHarvest'])bool(source,key,target);
       if(own(source,'selected'))target.selected=dict(source.selected);
       if(own(source,'conditions')) {
         const values=dict(source.conditions);
@@ -245,7 +245,7 @@
         s.protect.threshold = raw.protect.threshold;
       }
     }
-    for (const key of ['hatch','sell','cropSell','restore']) if (own(raw.teams, key)) {
+    for (const key of ['hatch','sell','cropSell','cropHarvest','restore']) if (own(raw.teams, key)) {
       if (typeof raw.teams[key] !== 'string' || raw.teams[key].length > 160) throw Error('팀 설정 형식 오류');
       s.teams[key] = raw.teams[key];
     }
@@ -805,6 +805,7 @@
     return {color:['Rainbow','Gold'].filter(id=>goal[id]),weather,lunar,lunarFamily:dawn&&amber?'lunar':dawn?'dawn':'amber',size:goal.size100};
   }
   function fruitMonitorConditions(value){return {...FRUIT_MONITOR_CONDITION_DEFAULTS,...value};}
+  const managesFruit=(selection,tile,fruit)=>selection?.[tile.species]===true||selection?.[fruit?.species]===true;
   function fruitMonitorSpeciesName(id,catalog={}){return catalog.plants?.[id]?.name||catalog.plants?.[id]?.plant?.name||({Starweaver:'Starweaver',DawnCelestial:'Dawnbinder',MoonCelestial:'Moonbinder'})[id]||id;}
   function inspectFruit(fruit,tileIndex,index,parentSpecies,now,conditions,minSize=100) {
     const species=typeof fruit.species==='string'&&fruit.species?fruit.species:parentSpecies;
@@ -869,14 +870,34 @@
       if(!Array.isArray(tile.slots)){if(selection?.[tile.species]===true)unknownTiles.push(tileIndex);continue;}
       for(let index=0;index<tile.slots.length;index++) {
         const fruit=tile.slots[index];if(!fruit||typeof fruit!=='object')continue;
-        const species=typeof fruit.species==='string'&&fruit.species?fruit.species:tile.species;
         // A selected plant includes its actual alternate fruit species (e.g. Stormcap).
         // Never synthesize fruit from slot capacity or current weather.
-        if(selection?.[species]!==true&&selection?.[tile.species]!==true)continue;
+        if(!managesFruit(selection,tile,fruit))continue;
         rows.push(inspectFruit(fruit,tileIndex,index,tile.species,now,conditions,minSize));
       }
     }
     return {ready,rows,unknownTiles,counts:countMonitoredFruit(rows)};
+  }
+  function harvestFruit(tile,slotId) {
+    if(tile?.objectType!=='plant'||!Number.isInteger(slotId)||slotId<0||!Array.isArray(tile.slots))return null;
+    const matches=tile.slots.filter(fruit=>fruit?.slotId===slotId);
+    return matches.length===1?matches[0]:null;
+  }
+  function harvestEligible(tile,fruit,tileIndex,options,now) {
+    return !!fruit&&managesFruit(options.selected,tile,fruit)&&!!growSlotStamp(fruit)&&fruit.locked!==true&&
+      finite(fruit.endTime)&&fruit.endTime<=now&&inspectFruit(fruit,tileIndex,0,tile.species,now,options.conditions,options.minSize).basic;
+  }
+  function harvestProtection(objects,command,options,now) {
+    if(command?.type!=='HarvestCrop'||!options.protectHarvest||!Object.values(options.selected).some(Boolean)||
+      !Object.values(options.conditions).some(Boolean))return '';
+    const tile=objects?.[command.slot];
+    if(tile?.objectType!=='plant')return '수확 보호 · 열매 위치 확인 대기';
+    const fruit=harvestFruit(tile,command.slotsIndex);
+    if(!fruit)return (managesFruit(options.selected,tile)||tile.slots?.some?.(slot=>managesFruit(options.selected,tile,slot)))?
+      '수확 보호 · 열매 정보 확인 대기':'';
+    if(!managesFruit(options.selected,tile,fruit))return '';
+    const row=inspectFruit(fruit,command.slot,0,tile.species,now,options.conditions,options.minSize);
+    return row.basic?'':row.unknown?'수확 보호 · 완료 조건 확인 대기':'수확 보호 · 완료 조건 미달';
   }
 
   // Completion is never inferred from zero targets, missing slots or uncertain target data.
@@ -893,8 +914,9 @@
   }
 
   class GameLink {
-    constructor(page, changed = () => {}) {
+    constructor(page, changed = () => {}, protectHarvest = () => '') {
       this.page = page; this.changed = changed; this.root = null; this.socket = null;
+      this.protectHarvest=protectHarvest;this.nativeHarvestHooks=new WeakSet();
       this.selfId = ''; this.generation = 0; this.revision = 0; this.pending = new Map(); this.sessions = new WeakMap();
       this.shopWatch = new Map();
       this.serverClock=null;
@@ -910,6 +932,8 @@
         if (this === link.socket && typeof payload === 'string') {
           try {
             const msg = JSON.parse(payload);
+            const command=msg.type==='QuinoaCommand'?msg.command:msg;
+            if(link.denyHarvest(command,msg.requestId))return;
             if(msg.type==='PlayerPosition' && Array.isArray(msg.scopePath) && msg.scopePath.at(-1)==='Quinoa' &&
               Number.isInteger(msg.position?.x) && Number.isInteger(msg.position?.y))position={x:msg.position.x,y:msg.position.y};
             if (msg.type === 'QuinoaCommand') {
@@ -922,7 +946,6 @@
               }
               msg.commandSequence=seq;payload = JSON.stringify(msg);
             }
-            const command=msg.type==='QuinoaCommand'?msg.command:msg;
             if(command?.type==='SetSelectedItem' && !link.pending.has(msg.requestId))link.manualSelectionRevision++;
             if(command?.type==='ApplyPetTeam' && typeof command.teamId==='string' && command.teamId && !link.pending.has(msg.requestId)) {
               const data=link.data(),known=nativeTeams(data)?.find(t=>t.id===command.teamId);
@@ -945,6 +968,27 @@
       });
       const existing = this.page.MagicCircle_RoomConnection?.currentWebSocket;
       if (existing) this.track(existing);
+    }
+    denyHarvest(command,requestId) {
+      if(command?.type!=='HarvestCrop'||!this.root)return false;
+      const reason=this.protectHarvest(command,mySlot(this.root,this.selfId)?.data?.garden?.tileObjects,this.serverNow()??Date.now());
+      if(!reason)return false;
+      const pending=this.pending.get(requestId);
+      if(pending)pending.error=Error(reason);
+      else this.changed(reason);
+      return true;
+    }
+    hookNativeHarvest() {
+      const room=this.page.MagicCircle_RoomConnection;
+      if(room?.currentWebSocket!==this.socket||typeof room.trySendMessageNow!=='function'||this.nativeHarvestHooks.has(room))return;
+      const link=this,send=room.trySendMessageNow;
+      // A false return tells the native client to skip its optimistic harvest.
+      const guarded=function(message,...rest) {
+        const command=message?.type==='QuinoaCommand'?message.command:message;
+        if(this.currentWebSocket===link.socket&&link.denyHarvest(command,message?.requestId))return false;
+        return send.call(this,message,...rest);
+      };
+      try{room.trySendMessageNow=guarded;this.nativeHarvestHooks.add(room);}catch{ /* The socket guard remains available. */ }
     }
     track(socket) {
       if (this.sessions.has(socket)) return this.sessions.get(socket);
@@ -980,6 +1024,7 @@
         this.revision++;
         this.shopWatch.clear(); this.observeShops();
         const session = this.sessions.get(socket); session.next = Math.max(1,Number(msg.executedCommandSequence || 0)+1); session.sent.clear();
+        this.hookNativeHarvest();
         this.changed('게임 연결됨',{type:'ready'}); return;
       }
       if (socket !== this.socket) return;
@@ -1134,13 +1179,16 @@
     skinsAPI()?.setCatalog?.(catalog,journalOrder(catalog,'Produce',Object.keys(catalog.plants)));
   }
   page.addEventListener('snail-with-skins:config-change',syncSkinsControl);
-  let panel, content, footer, icon, cropIcon, cropPanel, cropContent, shadow, lastPaint = 0, paintTimer=null, cropRevision=0;
+  let panel, content, footer, icon, cropIcon, cropPanel, cropContent, cropFooter, shadow, lastPaint = 0, paintTimer=null, cropRevision=0;
   const pendingBuy=new Set();let drainTimer=null,draining=false,readyGeneration=-1;
   const pendingFeed=new Map(),feedStates=new Map();let feedTimer=null,lastFeedAt=0;
   let webhookQueue = Promise.resolve();
   const log = [];
   const save = () => GM_setValue(KEY,settings);
   function report(message) {
+    if(cropFooter && cropFooter.textContent!==message && (running?.kind==='cropHarvest'||message.startsWith('수확 보호'))){
+      cropFooter.hidden=false;cropFooter.textContent=message;
+    }
     if(status===message)return;
     status = message; log.unshift(`${new Date().toLocaleTimeString('ko-KR')}  ${message}`); log.length = Math.min(log.length,50);
     if (footer) footer.textContent = message;
@@ -1158,7 +1206,7 @@
     if(event?.feedChanged)observeFeed();
     if(event?.uiChanged || event?.restocked?.length || event?.type?.startsWith('native-team'))schedulePaint();
     if (footer && footer.textContent!==status) footer.textContent = status;
-  });
+  },(command,objects,now)=>harvestProtection(objects,command,settings.cropManager,now));
   game.install();
   const nativeGameTeams=new NativeGameTeams(page,schedulePaint);
   function request(url, options = {}) {
@@ -1345,6 +1393,14 @@
     catch(error) {
       report(error.message+(kind==='buy' && settings.autoBuy?' · 입고 시 구매 On 유지 · 다음 입고·재접속 때 재확인':''));
     } finally { running = null; observeFeed();refresh();wakeAutomation(); }
+  }
+  function stopCurrentJob() {
+    if(!running)return;
+    running.cancel=true;
+    if(running.kind==='feed')setAutoFeed(false);
+    if(running.kind==='buy')setAutoBuy(false);
+    save();
+    report('현재 요청 확인 후 중지합니다.');
   }
   async function feedPet(job,entry) {
     const state=feedStates.get(entry.id);if(state)state.complete=true;
@@ -1806,6 +1862,52 @@
       if (restore && (changed || settings.teams.restore !== 'current')) await applyTeam(restore,job,true);
     }
   }
+  function harvestCompletedCrops() {
+    void run('cropHarvest',async job=>{
+      const options=settings.cropManager;
+      const tiles=garden(game.data()),now=game.serverNow()??Date.now();
+      const targets=[];
+      for(const slot of orderedTiles(settings.eggs.direction,Object.keys(tiles).map(Number))) {
+        const tile=tiles[slot];
+        if(tile?.objectType!=='plant'||!Array.isArray(tile.slots))continue;
+        for(const fruit of tile.slots)if(fruit&&harvestFruit(tile,fruit.slotId)===fruit&&harvestEligible(tile,fruit,slot,options,now)) {
+          targets.push({slot,slotId:fruit.slotId,plantSpecies:tile.species,plantedAt:tile.plantedAt,
+            stamp:growSlotStamp(fruit),species:fruit.species,preserved:fruit.preserved===true});
+        }
+      }
+      if(!targets.length){report('완료 조건을 충족한 수확 가능 열매가 없습니다.');return;}
+      if(inventoryBagCount(game.data().inventory)>=100)throw Error('인벤토리 가득 참');
+      const preserved=targets.filter(target=>target.preserved).length;
+      if(!await confirmAction('완료 작물 수확 확인','완료한 열매를 수확할까요?',
+        `대상 열매 ${targets.length}개${preserved?` · 보존된 열매 ${preserved}개 포함`:''}`,'수확 진행')){
+        report('작물 수확 취소');return;
+      }
+      let done=0,skipped=0;
+      const harvest=async()=>{
+        for(const target of targets) {
+          checkJob(job);
+          const data=game.data(),tile=garden(data)[target.slot],fruit=harvestFruit(tile,target.slotId);
+          if(tile?.species!==target.plantSpecies||tile.plantedAt!==target.plantedAt||growSlotStamp(fruit)!==target.stamp||
+            (fruit.preserved===true&&!target.preserved)||!harvestEligible(tile,fruit,target.slot,settings.cropManager,game.serverNow()??Date.now())) {
+            skipped++;continue;
+          }
+          if(inventoryBagCount(data.inventory)>=100)throw Error('인벤토리 가득 참');
+          const cropItemId=page.crypto.randomUUID();
+          report(`작물 수확 중 · ${done}개 확인`);
+          await game.command('HarvestCrop',{slot:target.slot,slotsIndex:target.slotId,cropItemId},next=>
+            growSlotStamp(harvestFruit(next.garden?.tileObjects?.[target.slot],target.slotId))!==target.stamp&&
+              next.inventory.items.some(item=>item?.itemType==='Produce'&&item.id===cropItemId&&item.species===target.species),
+            12000,{stateConfirms:true});
+          done++;
+        }
+      };
+      try{
+        if(settings.teams.cropHarvest)await withTeam('cropHarvest',job,harvest);
+        else await harvest();
+      }catch(error){throw Error(`작물 수확 ${done}개 확인 · ${error.message}`);}
+      report(`작물 수확 완료 · 열매 ${done}개${skipped?` · 변경·조건 제외 ${skipped}개`:''}`);
+    });
+  }
   function sellCrops() {
     if(running){report('진행 중인 작업이 끝난 뒤 실행하세요.');return;}
     if(!settings.teams.cropSell) {
@@ -2130,6 +2232,11 @@
       crops.append(el('summary',{},cropSummary),choices);goals.append(el('summary',{text:'완료 조건'}));
       for(const [key,details] of [['cropsOpen',crops],['goalsOpen',goals]])details.addEventListener('toggle',()=>{if(!details.isConnected)return;settings.cropManager[key]=details.open;save();placeWindow(cropPanel,cropPanelPosition);});
       const conditions=el('div',{class:'category-body'}),checks=new Map();
+      const protection=switchFor(options.protectHarvest,value=>{
+        settings.cropManager.protectHarvest=value;
+        report(`수확 보호 ${value?'On':'Off'}`);
+      },'미완료 열매 수확 보호');
+      conditions.append(row('미완료 열매 수확 보호',protection,'대상 작물에 적용됩니다.'));
       for(const [name,ids] of [['색 변이',['Rainbow','Gold']],['기상',['Thundercharged','Thunderstruck','Wet','Chilled','Frozen']],['달 변이',['Ambercharged','Ambershine','Dawncharged','Dawnlit']]]) {
         const group=el('div',{class:'goal-options'});
         for(const id of ids) {
@@ -2145,10 +2252,16 @@
       }});
       conditions.append(el('div',{class:'goal-row'},el('small',{text:'크기'}),el('div',{class:'goal-options'},el('label',{},sizeCheck,monitorIcon('size100','크기')),size,'이상')),
         el('small',{text:'같은 줄은 하나만 충족해도 됩니다. 켜 둔 줄은 모두 충족해야 완료입니다. 선택된 목표가 모든 대상 열매에 적용되면 초록색으로 표시합니다.'}));goals.append(conditions);
-      root.append(stats,total,notice,crops,goals,el('small',{text:'내 밭의 실제 열매만 집계합니다. 자동 수확·세정·포션 사용은 하지 않습니다. ❌ 조건 미달 · 🫧 강화로 해결할 수 없어 Crop Cleanser가 필요한 열매(보존 열매 제외).'}));
-      cropContent.append(root);cropManagerUI={root,stats,total,notice,crops,goals,cropSummary,choices,checks,size,choiceSignature:'',resultSignature:''};
+      const harvest=button('완료 작물 모두 수확',harvestCompletedCrops,'primary');
+      const stop=button('작물 수확 중지',stopCurrentJob,'crop-stop');
+      root.append(stats,total,notice,crops,goals,el('div',{class:'pot-actions'},harvest,stop),
+        el('small',{text:'❌ 조건 미달 · 🫧 강화로 해결할 수 없어 Crop Cleanser가 필요한 열매(보존 열매 제외).'}));
+      cropContent.append(root);cropManagerUI={root,stats,total,notice,crops,goals,cropSummary,choices,checks,size,protection,harvest,stop,choiceSignature:'',resultSignature:''};
     }
     const ui=cropManagerUI;
+    ui.harvest.disabled=!!running;
+    ui.stop.hidden=running?.kind!=='cropHarvest';
+    ui.protection.querySelector('input').checked=options.protectHarvest;
     let data=null;try{data=game.data();}catch{}
     if(ui.availableRevision!==cropRevision || ui.availableCatalog!==catalog) {
       const available=new Set(Object.keys(catalog.plants || {}).filter(id=>catalog.plants[id]?.crop));
@@ -2444,7 +2557,7 @@
   }
   function teamOptions(key,teams) {
     const options=(teams || []).map(t=>[t.id,`${t.manual?'직접 등록 · ':''}${typeof t.name==='string' && t.name.trim()?t.name:t.id}`]);
-    const opts=key==='restore'?[['current','현재 프리셋'],...options]:[['',key==='cropSell'?'팀 선택':'변경 안 함'],...options];
+    const opts=key==='restore'?[['current','현재 프리셋'],...options]:[['',key==='cropSell'?'팀 선택':key==='cropHarvest'?'현재 팀 사용':'변경 안 함'],...options];
     if(settings.teams[key]&&!opts.some(([id])=>id===settings.teams[key]))opts.push([settings.teams[key],teams===null?'팀 목록 확인 대기':'선택한 팀 확인 필요']);
     return opts;
   }
@@ -2483,7 +2596,7 @@
     if(!/^[\w:.-]{1,160}$/.test(id))throw Error('프리셋 ID 형식을 확인하세요.');
     if(!accountId)throw Error('내 계정 정보 확인 대기 · 프리셋 등록 보류');
     if(ids.length<1 || ids.length>3 || new Set(ids).size!==ids.length)throw Error('사용 중인 펫 1~3마리를 확인한 뒤 등록하세요.');
-    const names={hatch:'부화',sell:'판매',cropSell:'작물 판매',restore:'복구'};
+    const names={hatch:'부화',sell:'판매',cropSell:'작물 판매',cropHarvest:'작물 수확',restore:'복구'};
     const previous=settings.registeredTeams.find(t=>t.id===id && t.accountId===accountId);
     if(!previous && settings.registeredTeams.length>=60)throw Error('직접 등록 프리셋은 최대 60개입니다.');
     const record={id,accountId,name:previous?.name || (detected?.id===id && detected.name) || `${names[key]} 프리셋`,members:ids.map(petId=>({petId}))};
@@ -2497,7 +2610,7 @@
     details.addEventListener('toggle',()=>{if(details.isConnected){settings.manualTeamsOpen=details.open;save();placePanel();}});
     const body=el('div',{class:'category-body'});
     body.append(el('small',{text:'게임에서 원하는 펫 팀을 한 번 적용한 뒤, 해당 용도의 현재 프리셋 버튼을 누르세요. 팀 목록 없이도 등록할 수 있습니다.'}));
-    for(const [key,label] of [['hatch','부화'],['sell','판매'],['cropSell','작물 판매'],['restore','복구']]) {
+    for(const [key,label] of [['hatch','부화'],['sell','판매'],['cropSell','작물 판매'],['cropHarvest','작물 수확'],['restore','복구']]) {
       const input=el('input',{type:'text',ariaLabel:`${label} 프리셋 ID 직접 입력`,placeholder:'현재 팀 ID 또는 직접 입력',value:settings.teams[key]==='current'?'':settings.teams[key],maxLength:160});
       const apply=button('현재 프리셋',()=>{try{registerCurrentTeam(key);}catch(error){report(error.message);}});
       apply.setAttribute('aria-label',`${label} 현재 프리셋 등록`);
@@ -2530,10 +2643,10 @@
       node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
     }
     content.append(el('h3',{text:'작물 프리셋'}));
-    const cropOptions=teamOptions('cropSell',teams);
-    const cropTeam=select(settings.teams.cropSell,cropOptions,value=>{settings.teams.cropSell=value;syncTeamControls();},'작물 판매 프리셋');
-    cropTeam.dataset.preset='cropSell';cropTeam.dataset.options=JSON.stringify(cropOptions);
-    content.append(row('작물 판매 프리셋',cropTeam));
+    for(const [key,name] of [['cropSell','작물 판매 프리셋'],['cropHarvest','작물 수확 프리셋']]) {
+      const opts=teamOptions(key,teams),node=select(settings.teams[key],opts,value=>{settings.teams[key]=value;syncTeamControls();},name);
+      node.dataset.preset=key;node.dataset.options=JSON.stringify(opts);content.append(row(name,node));
+    }
     content.append(el('small',{class:'team-status'}),button('팀 목록 새로고침',()=>void refreshNativeTeams()));
     content.append(renderManualTeams());
     syncTeamControls();
@@ -2573,7 +2686,6 @@
       '판매 진행',pets.map(p=>p.name||title('Pet',p.petSpecies)));
   }
   function confirmAction(label,heading,description,action,items=[]) {
-    panel.hidden=false;
     return new Promise(resolve=>{
       const overlay=el('div',{class:'overlay',role:'dialog',ariaLabel:label});
       const end=value=>{overlay.remove();resolve(value);};
@@ -2666,11 +2778,12 @@
       el('div',{class:'brand'},el('strong',{text:'Original Snail',class:'title-handle',title:'드래그하여 창 이동'}),button('×',()=>panel.hidden=true)),
       el('div',{class:'badges'},el('span',{class:'connection',text:'○ 연결 대기'}),el('span',{class:'version',text:VERSION})),
       el('div',{class:'subhead'},button('‹ 뒤로',()=>go('home'),'back'),el('span',{class:'page-name'}))),content,footer,
-      button('중지',()=>{if(running){running.cancel=true;if(running.kind==='feed')setAutoFeed(false);if(running.kind==='buy')setAutoBuy(false);save();}report('현재 요청 확인 후 중지합니다.');},'stop'));
+      button('중지',stopCurrentJob,'stop'));
     enablePanelDrag(panel.querySelector('header'));
     cropContent=el('main',{class:'body'});
     const cropHeader=el('header',{},el('div',{class:'brand'},el('strong',{text:'🏡 작물 관리'}),button('×',()=>cropPanel.hidden=true)));
-    cropPanel=el('section',{class:'crop-window',hidden:true,ariaLabel:'작물 관리 창'},cropHeader,cropContent);
+    cropFooter=el('footer',{class:'crop-status',role:'status','ariaLive':'polite',hidden:true});
+    cropPanel=el('section',{class:'crop-window',hidden:true,ariaLabel:'작물 관리 창'},cropHeader,cropContent,cropFooter);
     enablePanelDrag(cropHeader,cropPanel,position=>{cropPanelPosition=position;placeWindow(cropPanel,position);});
     shadow.append(style,icon,cropIcon,panel,cropPanel);placeIcon();placeCropIcon();
     window.addEventListener('resize',()=>{placeIcon();placeCropIcon();placePanel();placeWindow(cropPanel,cropPanelPosition);});refresh();void loadCatalog();
